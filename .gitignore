@@ -1,0 +1,18 @@
+# Build outputs
+game.js
+game_gbc.js
+game_ps1.js
+game.wasm
+game.data
+
+# Emscripten generated
+*.mem
+*.symbols
+
+# Cores — cloned at build time by build.sh
+cores/
+
+# Object files
+*.o
+*.a
+*.bc

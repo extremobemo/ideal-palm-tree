@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Retro TV</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a1a; display: flex; flex-direction: column;
+         align-items: center; justify-content: center; height: 100vh; gap: 10px; }
+  canvas { display: block; cursor: crosshair; }
+  #ui { color: #888; font: 12px monospace; text-align: center; }
+  #overlay {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; background: rgba(0,0,0,0.5);
+    color: #ccc; font: 16px monospace; flex-direction: column; gap: 10px;
+    pointer-events: none;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h2 { color: #fff; }
+  label {
+    display: inline-block; padding: 6px 14px; background: #222;
+    border: 1px solid #444; border-radius: 4px; cursor: pointer; color: #ddd;
+  }
+  label:hover { background: #333; }
+  #wrap { position: relative; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="canvas"></canvas>
+  <div id="overlay">
+    <h2>Retro TV</h2>
+    <p>Click to enter &nbsp;|&nbsp; ESC to release mouse</p>
+    <p style="font-size:11px; color:#666">
+      WASD: move &nbsp;|&nbsp; Mouse: look<br>
+      Arrows: D-pad &nbsp;|&nbsp; Z: A &nbsp;|&nbsp; X: B &nbsp;|&nbsp; Enter: Start &nbsp;|&nbsp; Shift: Select
+    </p>
+  </div>
+</div>
+<div id="ui">
+  <label>Load ROM
+    <input type="file" id="rom-input" accept=".gb,.gbc,.nes,.sfc,.smc,.gba" hidden>
+  </label>
+  &nbsp; <span id="status">No ROM loaded</span>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const overlay = document.getElementById('overlay');
+
+// Size canvas to ~90% of window, 16:9
+(function sizeCanvas() {
+  const pad = 80; // space for UI bar below
+  const maxW = Math.round(window.innerWidth * 0.75);
+  const maxH = window.innerHeight - pad;
+  const aspect = 16 / 9;
+  let w = maxW, h = Math.round(maxW / aspect);
+  if (h > maxH) { h = maxH; w = Math.round(h * aspect); }
+  canvas.width  = w;
+  canvas.height = h;
+})();
+
+// ── Pointer lock ─────────────────────────────────────────────
+canvas.addEventListener('click', () => canvas.requestPointerLock());
+
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement === canvas) {
+    overlay.classList.add('hidden');
+  } else {
+    overlay.classList.remove('hidden');
+  }
+});
+
+document.addEventListener('mousemove', e => {
+  if (document.pointerLockElement === canvas) {
+    Module.ccall('add_mouse_delta', 'void', ['number','number'],
+                 [e.movementX, e.movementY]);
+  }
+});
+
+// ── Movement keys (WASD) ─────────────────────────────────────
+const MOVE_MAP = { 'KeyW':0, 'KeyS':1, 'KeyA':2, 'KeyD':3 };
+
+// ── Game controller keys ──────────────────────────────────────
+// RETRO_DEVICE_ID_JOYPAD: B=0 Y=1 SELECT=2 START=3 UP=4 DOWN=5 LEFT=6 RIGHT=7 A=8
+const GAME_MAP = {
+  'ArrowUp':    4,
+  'ArrowDown':  5,
+  'ArrowLeft':  6,
+  'ArrowRight': 7,
+  'Enter':      3,
+  'ShiftLeft':  2,
+  'ShiftRight': 2,
+  'KeyZ':       8,  // A button
+  'KeyX':       0,  // B button
+  'KeyQ':      10,  // L
+  'KeyE':      11,  // R
+};
+
+document.addEventListener('keydown', e => {
+  if (MOVE_MAP[e.code] !== undefined) {
+    e.preventDefault();
+    Module.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],1]);
+  }
+  if (GAME_MAP[e.code] !== undefined) {
+    e.preventDefault();
+    Module.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],1]);
+  }
+});
+
+document.addEventListener('keyup', e => {
+  if (MOVE_MAP[e.code] !== undefined)
+    Module.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],0]);
+  if (GAME_MAP[e.code] !== undefined)
+    Module.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],0]);
+});
+
+// ── ROM loading ───────────────────────────────────────────────
+document.getElementById('rom-input').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById('status').textContent = 'Loading ' + file.name + '...';
+  const reader = new FileReader();
+  reader.onload = ev => {
+    FS.writeFile('/rom.bin', new Uint8Array(ev.target.result));
+    Module.ccall('start_game', 'void', ['string'], ['/rom.bin']);
+    document.getElementById('status').textContent = 'Playing: ' + file.name;
+  };
+  reader.readAsArrayBuffer(file);
+});
+</script>
+
+<script src="game.js"></script>
+</body>
+</html>
