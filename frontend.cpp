@@ -164,8 +164,9 @@ bool retro_environment(unsigned cmd, void* data) {
         case RETRO_ENVIRONMENT_GET_CAN_DUPE:
             *(bool*)data=true; return true;
         case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+            *(const char**)data="/system/"; return true;
         case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
-            *(const char**)data="/"; return true;
+            *(const char**)data="/saves/"; return true;
         case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
             ((retro_log_callback*)data)->log=retro_log_cb; return true;
         default: return false;

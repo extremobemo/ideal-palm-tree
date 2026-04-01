@@ -114,7 +114,47 @@ em++ -O2 -std=c++17 \
   --preload-file tv/ \
   -o game_snes.js
 
-# ── 7. Download N64Wasm prebuilt files ────────────────────────────────────────
+# ── 7. Build PCSX-ReARMed core ────────────────────────────────────────────────
+PCSX_A=cores/pcsx_rearmed/pcsx_rearmed_libretro.a
+
+if [ ! -f "$PCSX_A" ]; then
+  mkdir -p cores
+  [ ! -d cores/pcsx_rearmed ] && \
+    git clone --depth 1 https://github.com/libretro/pcsx_rearmed cores/pcsx_rearmed
+
+  cd cores/pcsx_rearmed
+  emmake make -f Makefile.libretro platform=emscripten CC=emcc CXX=em++ AR=emar RANLIB=emranlib CFLAGS_OPT="-O2 -sUSE_ZLIB=1"
+  if [ -f pcsx_rearmed_libretro_emscripten.bc ]; then
+    cp pcsx_rearmed_libretro_emscripten.bc "$SCRIPT_DIR/$PCSX_A"
+  elif [ -f pcsx_rearmed_libretro.bc ]; then
+    cp pcsx_rearmed_libretro.bc "$SCRIPT_DIR/$PCSX_A"
+  elif [ -f pcsx_rearmed_libretro.a ]; then
+    cp pcsx_rearmed_libretro.a "$SCRIPT_DIR/$PCSX_A"
+  fi
+  cd "$SCRIPT_DIR"
+fi
+
+[ ! -f "$PCSX_A" ] && { echo "pcsx_rearmed build failed: archive not found"; exit 1; }
+echo "PCSX-ReARMed: $PCSX_A"
+
+# ── 8. Link PS1 bundle ────────────────────────────────────────────────────────
+echo "Linking game_ps1.js..."
+em++ -O2 -std=c++17 \
+  -I include \
+  -I "$LIBRETRO_COMMON/include" \
+  frontend.cpp \
+  "$COMMON_A" \
+  "$PCSX_A" \
+  -sUSE_ZLIB=1 \
+  -s FULL_ES2=1 \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS"]' \
+  -s EXPORTED_FUNCTIONS="$EXPORTS" \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s INITIAL_MEMORY=268435456 \
+  --preload-file tv/ \
+  -o game_ps1.js
+
+# ── 9. Download N64Wasm prebuilt files ────────────────────────────────────────
 if [ ! -f n64wasm.js ]; then
   echo "Downloading N64Wasm prebuilt..."
   curl -Lo n64wasm.js \

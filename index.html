@@ -56,7 +56,11 @@
 </div>
 <div id="ui">
   <label>Load ROM
-    <input type="file" id="rom-input" accept=".gb,.gbc,.sfc,.smc,.fig,.swc,.bs,.z64,.n64,.v64" hidden>
+    <input type="file" id="rom-input" accept=".gb,.gbc,.sfc,.smc,.fig,.swc,.bs,.z64,.n64,.v64,.chd,.cue,.bin,.img" hidden multiple>
+  </label>
+  &nbsp;
+  <label>PS1 BIOS
+    <input type="file" id="bios-input" accept=".bin" hidden>
   </label>
   &nbsp; <span id="status">No ROM loaded</span>
 </div>
@@ -90,13 +94,19 @@ const CORE_MAP = {
   'fig': 'game_snes.js',
   'swc': 'game_snes.js',
   'bs':  'game_snes.js',
+  'bin': 'game_ps1.js',
+  'cue': 'game_ps1.js',
+  'chd': 'game_ps1.js',
+  'img': 'game_ps1.js',
 };
 const N64_EXTS = new Set(['z64', 'n64', 'v64']);
+const PS1_EXTS = new Set(['bin', 'cue', 'chd', 'img']);
 
 let coreModule = null;   // libretro frontend module (game_gbc.js or game_snes.js)
 let loadedCore = null;
 let n64Module  = null;   // n64wasm module
 let n64Running = false;
+let ps1BiosLoaded = false;  // true once a BIOS file has been written to /system/
 
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
@@ -327,6 +337,22 @@ document.addEventListener('keyup', e => {
     coreModule.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],0]);
 });
 
+// ── PS1 BIOS loading ──────────────────────────────────────────
+document.getElementById('bios-input').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    // BIOS must be written after the PS1 core module loads (it owns the FS).
+    // We stash the bytes and write them just before start_game instead.
+    window._ps1BiosName  = file.name;
+    window._ps1BiosBytes = new Uint8Array(ev.target.result);
+    ps1BiosLoaded = true;
+    setStatus('BIOS ready: ' + file.name + ' — now load a PS1 disc');
+  };
+  reader.readAsArrayBuffer(file);
+});
+
 // ── ROM loading ───────────────────────────────────────────────
 document.getElementById('rom-input').addEventListener('change', function(e) {
   const file = e.target.files[0];
@@ -343,6 +369,32 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
     setStatus('Unsupported format: .' + ext);
     return;
   }
+
+  if (PS1_EXTS.has(ext)) {
+    if (!ps1BiosLoaded) {
+      setStatus('Load a PS1 BIOS (.bin) first, then reload your disc');
+      return;
+    }
+    loadCore(bundle, function() {
+      // Write BIOS into /system/ on the now-ready FS
+      try { coreModule.FS.mkdir('/system'); } catch(e) {}
+      try { coreModule.FS.mkdir('/saves');  } catch(e) {}
+      coreModule.FS.writeFile('/system/' + window._ps1BiosName, window._ps1BiosBytes);
+
+      setStatus('Loading ' + file.name + '...');
+      const reader = new FileReader();
+      reader.onload = function(ev) {
+        const romPath = '/' + file.name;
+        coreModule.FS.writeFile(romPath, new Uint8Array(ev.target.result));
+        // For .cue discs the entry point is the .cue file itself
+        coreModule.ccall('start_game', 'void', ['string'], [romPath]);
+        setStatus('Playing: ' + file.name);
+      };
+      reader.readAsArrayBuffer(file);
+    });
+    return;
+  }
+
   loadCore(bundle, function() {
     setStatus('Loading ' + file.name + '...');
     const reader = new FileReader();
