@@ -727,6 +727,15 @@ extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {
     else printf("retro_load_game failed\n");
 }
 
+extern "C" EMSCRIPTEN_KEEPALIVE int get_game_tex_id() {
+    return (int)g_game_tex;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_frame_size(int w, int h) {
+    g_frame_w = (unsigned)w;
+    g_frame_h = (unsigned)h;
+}
+
 // ============================================================
 //  Main loop + init
 // ============================================================

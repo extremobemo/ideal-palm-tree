@@ -7,6 +7,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+EXPORTS='["_main","_start_game","_set_button","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size"]'
+
 # ── 1. Get libretro.h ─────────────────────────────────────────────────────────
 if [ ! -f include/libretro.h ]; then
   mkdir -p include
@@ -68,7 +70,7 @@ em++ -O2 -std=c++17 \
   "$GAMBATTE_A" \
   -s FULL_ES2=1 \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS"]' \
-  -s EXPORTED_FUNCTIONS='["_main","_start_game","_set_button","_set_move_key","_add_mouse_delta"]' \
+  -s EXPORTED_FUNCTIONS="$EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
   --preload-file tv/ \
@@ -82,11 +84,9 @@ if [ ! -f "$SNES9X_A" ]; then
   [ ! -d cores/snes9x ] && \
     git clone --depth 1 https://github.com/libretro/snes9x cores/snes9x
 
-  # snes9x libretro port lives in the libretro/ subdirectory
   cd cores/snes9x/libretro
   emmake make platform=emscripten CC=emcc CXX=em++ AR=emar RANLIB=emranlib \
     HAVE_THREADS=0 HAVE_NEON=0
-  # Find the output .bc and copy with .a extension
   if [ -f snes9x_libretro_emscripten.bc ]; then
     cp snes9x_libretro_emscripten.bc "$SCRIPT_DIR/$SNES9X_A"
   elif [ -f snes9x_libretro.bc ]; then
@@ -108,11 +108,22 @@ em++ -O2 -std=c++17 \
   "$SNES9X_A" \
   -s FULL_ES2=1 \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS"]' \
-  -s EXPORTED_FUNCTIONS='["_main","_start_game","_set_button","_set_move_key","_add_mouse_delta"]' \
+  -s EXPORTED_FUNCTIONS="$EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
   --preload-file tv/ \
   -o game_snes.js
+
+# ── 7. Download N64Wasm prebuilt files ────────────────────────────────────────
+if [ ! -f n64wasm.js ]; then
+  echo "Downloading N64Wasm prebuilt..."
+  curl -Lo n64wasm.js \
+    https://raw.githubusercontent.com/nbarkhina/N64Wasm/master/dist/n64wasm.js
+  curl -Lo n64wasm.wasm \
+    https://raw.githubusercontent.com/nbarkhina/N64Wasm/master/dist/n64wasm.wasm
+  curl -Lo assets.zip \
+    https://github.com/nbarkhina/N64Wasm/raw/master/dist/assets.zip
+fi
 
 echo ""
 echo "Build complete!  Serve with:"

@@ -4,6 +4,9 @@ game_gbc.js
 game_snes.js
 game_ps1.js
 game_dc.js
+n64wasm.js
+n64wasm.wasm
+assets.zip
 game.wasm
 game.data
 

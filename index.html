@@ -26,6 +26,23 @@
 </style>
 </head>
 <body>
+<!-- N64Wasm renders here; off-screen so it doesn't appear in layout -->
+<canvas id="n64canvas" width="640" height="480"
+        style="position:fixed;top:-1000px;left:-1000px;"></canvas>
+<script>
+// Force preserveDrawingBuffer on n64canvas so texImage2D can read rendered frames
+(function() {
+  var c = document.getElementById('n64canvas');
+  var orig = c.getContext.bind(c);
+  c.getContext = function(type, attrs) {
+    if (type === 'webgl2' || type === 'webgl') {
+      attrs = Object.assign({}, attrs || {}, { preserveDrawingBuffer: true });
+    }
+    return orig(type, attrs);
+  };
+})();
+</script>
+
 <div id="wrap">
   <canvas id="canvas"></canvas>
   <div id="overlay">
@@ -39,7 +56,7 @@
 </div>
 <div id="ui">
   <label>Load ROM
-    <input type="file" id="rom-input" accept=".gb,.gbc,.sfc,.smc,.fig,.swc,.bs" hidden>
+    <input type="file" id="rom-input" accept=".gb,.gbc,.sfc,.smc,.fig,.swc,.bs,.z64,.n64,.v64" hidden>
   </label>
   &nbsp; <span id="status">No ROM loaded</span>
 </div>
@@ -58,6 +75,10 @@ const overlay = document.getElementById('overlay');
   if (h > maxH) { h = maxH; w = Math.round(h * aspect); }
   canvas.width  = w;
   canvas.height = h;
+  // Lock dimensions — n64wasm's SDL fires resize events that would otherwise
+  // shrink this canvas to the N64 native resolution.
+  Object.defineProperty(canvas, 'width',  { get: () => w, set: () => {} });
+  Object.defineProperty(canvas, 'height', { get: () => h, set: () => {} });
 })();
 
 // ── Core routing ──────────────────────────────────────────────
@@ -70,46 +91,183 @@ const CORE_MAP = {
   'swc': 'game_snes.js',
   'bs':  'game_snes.js',
 };
+const N64_EXTS = new Set(['z64', 'n64', 'v64']);
 
-let coreModule = null;
+let coreModule = null;   // libretro frontend module (game_gbc.js or game_snes.js)
 let loadedCore = null;
+let n64Module  = null;   // n64wasm module
+let n64Running = false;
 
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
 
-// Capture any JS errors and show them in the status bar
 window.onerror = function(msg, src, line) {
   setStatus('JS error: ' + msg + ' (' + (src||'').split('/').pop() + ':' + line + ')');
 };
 
+// Inject a script and poll until window.Module.calledRun is true.
+// Saves the GL object BEFORE the new script can overwrite window.GL.
+function injectAndWait(src, onReady, onError) {
+  const s = document.createElement('script');
+  s.src = src;
+  s.onerror = function() { setStatus('Failed to load ' + src); if (onError) onError(); };
+  document.body.appendChild(s);
+  function check() {
+    if (window.Module && window.Module.calledRun) {
+      onReady(window.Module);
+    } else {
+      setTimeout(check, 100);
+    }
+  }
+  setTimeout(check, 200);
+}
+
 function loadCore(bundle, callback) {
   if (loadedCore === bundle) { callback(); return; }
-  if (loadedCore !== null) {
+  if (loadedCore !== null || n64Running) {
     if (!confirm('Loading a different core requires a page reload. Continue?')) return;
     location.reload();
     return;
   }
   setStatus('Loading core...');
+  injectAndWait(bundle, function(mod) {
+    coreModule = mod;
+    loadedCore = bundle;
+    callback();
+  });
+}
 
-  // Let Emscripten create its own Module — no pre-configuration needed.
-  // Poll until Module.calledRun is true, which means doRun() has finished
-  // (runtime init + main() + retro_init() all complete).
-  const s = document.createElement('script');
-  s.src = bundle;
-  s.onerror = function() { setStatus('Failed to load ' + bundle); };
-  document.body.appendChild(s);
+// ── N64 loading ───────────────────────────────────────────────
+// n64wasm.js (Emscripten 2.0.7) uses function/var declarations that conflict
+// with class/let declarations in game_gbc.js (newer Emscripten) in the shared
+// global lexical scope.  Fix: fetch the script as text, wrap it in an IIFE so
+// all its declarations stay local, then expose only Module via window._n64M.
+function loadN64Wasm(callback) {
+  window._n64ModuleInit = {
+    canvas: document.getElementById('n64canvas'),
+    noInitialRun: true,
+    locateFile: function(path) { return path; }
+  };
+  fetch('n64wasm.js')
+    .then(function(r) { return r.text(); })
+    .then(function(code) {
+      var wrapped = '(function(){\nvar Module=window._n64ModuleInit||{};\n'
+                  + code
+                  + '\nif(typeof FS!=="undefined")Module.FS=FS;\n'
+                  + 'if(typeof callMain!=="undefined")Module.callMain=callMain;\n'
+                  + 'window._n64M=Module;\n})();';
+      var blob = new Blob([wrapped], {type: 'application/javascript'});
+      var url  = URL.createObjectURL(blob);
+      var s = document.createElement('script');
+      s.src = url;
+      s.onerror = function() { setStatus('Failed to execute n64wasm.js'); };
+      document.body.appendChild(s);
+      (function check() {
+        if (window._n64M && window._n64M.calledRun) {
+          URL.revokeObjectURL(url);
+          callback(window._n64M);
+        } else {
+          setTimeout(check, 100);
+        }
+      })();
+    })
+    .catch(function() { setStatus('Failed to fetch n64wasm.js'); });
+}
 
-  function waitForReady() {
-    if (window.Module && window.Module.calledRun) {
-      coreModule = window.Module;
-      loadedCore = bundle;
-      callback();
-    } else {
-      setTimeout(waitForReady, 100);
-    }
+function loadN64(file) {
+  if (loadedCore !== null || n64Running) {
+    if (!confirm('Loading N64 requires a page reload. Continue?')) return;
+    location.reload();
+    return;
   }
-  setTimeout(waitForReady, 200);
+  setStatus('Loading N64 frontend...');
+
+  // Step 1: load game_gbc.js for the 3D TV scene (no libretro ROM needed)
+  injectAndWait('game_gbc.js', function(frontendMod) {
+    coreModule = frontendMod;
+    loadedCore = 'game_gbc.js';
+
+    // Save game_gbc's GL table NOW before n64wasm can overwrite window.GL
+    var frontendGL  = window.GL;
+    var frontendCtx = document.getElementById('canvas').getContext('webgl');
+    var texId = coreModule.ccall('get_game_tex_id', 'number', [], []);
+    // Tell the CRT shader that the game texture is N64-sized, not GBC-sized
+    coreModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
+
+    setStatus('Loading N64 emulator...');
+
+    // Step 2: load n64wasm isolated in an IIFE
+    loadN64Wasm(function(n64Mod) {
+      n64Module = n64Mod;
+
+      // Step 3: write ROM and start
+      setStatus('Loading ' + file.name + '...');
+      var reader = new FileReader();
+      reader.onload = function(ev) {
+        var romBytes = new Uint8Array(ev.target.result);
+
+        // N64Wasm requires assets.zip, config.txt, and cheat.txt on the
+        // virtual FS before callMain — same as their official demo does.
+        fetch('assets.zip')
+          .then(function(r) { return r.arrayBuffer(); })
+          .then(function(assetsBuf) {
+            var fs = n64Module.FS;
+            fs.writeFile('assets.zip', new Uint8Array(assetsBuf));
+
+            // config.txt format: one value per line, matching WriteConfigFile()
+            // in N64Wasm's script.js (gamepad mappings, keyboard mappings, settings)
+            var cfg = [
+              '12','13','14','15','0','2','9','4','6','5','11','-1','-1','-1','-1',
+              'b','n','y','h','Enter','i','k','j','l','a','q','e','s','d','`',
+              'Up','Down','Left','Right',
+              '0','0','0', // save files
+              '0','0','1', // fps, swap sticks, disable audio sync (1=free-running)
+              '0','0','0', // invert Y axis 2/3/4P
+              '0','0','0','0' // mobile, angrylion, mouse, vbo
+            ].join('\r\n') + '\r\n';
+            fs.writeFile('config.txt', cfg);
+            fs.writeFile('cheat.txt', '');
+
+            fs.writeFile('custom.v64', romBytes);
+            // Unlock the browser's audio context (user gesture already happened
+            // via the file picker, so this will succeed)
+            try { new AudioContext().resume(); } catch(e) {}
+            n64Module.callMain(['custom.v64']);
+            n64Running = true;
+            setStatus('Playing: ' + file.name);
+
+            // Step 4: copy n64canvas → g_game_tex every frame.
+            // Firefox refuses texImage2D(webgl2Canvas) into a WebGL1 context,
+            // so we blit through an intermediate 2D canvas first.
+            var n64canvas = document.getElementById('n64canvas');
+            var blitCanvas = document.createElement('canvas');
+            blitCanvas.width  = n64canvas.width;
+            blitCanvas.height = n64canvas.height;
+            var blit2d = blitCanvas.getContext('2d');
+            (function copyLoop() {
+              if (n64Running) {
+                var tex = frontendGL.textures[texId];
+                if (tex) {
+                  blit2d.drawImage(n64canvas, 0, 0);
+                  frontendCtx.bindTexture(frontendCtx.TEXTURE_2D, tex);
+                  frontendCtx.texImage2D(frontendCtx.TEXTURE_2D, 0,
+                    frontendCtx.RGBA, frontendCtx.RGBA,
+                    frontendCtx.UNSIGNED_BYTE, blitCanvas);
+                  frontendCtx.texParameteri(frontendCtx.TEXTURE_2D,
+                    frontendCtx.TEXTURE_MIN_FILTER, frontendCtx.LINEAR);
+                  frontendCtx.texParameteri(frontendCtx.TEXTURE_2D,
+                    frontendCtx.TEXTURE_MAG_FILTER, frontendCtx.LINEAR);
+                }
+              }
+              requestAnimationFrame(copyLoop);
+            })();
+          })
+          .catch(function() { setStatus('Failed to load assets.zip'); });
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  });
 }
 
 // ── Pointer lock ─────────────────────────────────────────────
@@ -174,18 +332,24 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
   const file = e.target.files[0];
   if (!file) return;
   const ext = file.name.split('.').pop().toLowerCase();
+
+  if (N64_EXTS.has(ext)) {
+    loadN64(file);
+    return;
+  }
+
   const bundle = CORE_MAP[ext];
   if (!bundle) {
-    document.getElementById('status').textContent = 'Unsupported format: .' + ext;
+    setStatus('Unsupported format: .' + ext);
     return;
   }
   loadCore(bundle, function() {
-    document.getElementById('status').textContent = 'Loading ' + file.name + '...';
+    setStatus('Loading ' + file.name + '...');
     const reader = new FileReader();
     reader.onload = ev => {
       coreModule.FS.writeFile('/rom.bin', new Uint8Array(ev.target.result));
       coreModule.ccall('start_game', 'void', ['string'], ['/rom.bin']);
-      document.getElementById('status').textContent = 'Playing: ' + file.name;
+      setStatus('Playing: ' + file.name);
     };
     reader.readAsArrayBuffer(file);
   });
