@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-EXPORTS='["_main","_start_game","_set_button","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size"]'
+EXPORTS='["_main","_start_game","_set_button","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size","_get_frame_ptr","_get_frame_w","_get_frame_h","_get_local_x","_get_local_y","_get_local_z","_get_local_yaw","_set_remote_player","_remove_remote_player"]'
 
 # ── 1. Get libretro.h ─────────────────────────────────────────────────────────
 if [ ! -f include/libretro.h ]; then
@@ -69,7 +69,7 @@ em++ -O2 -std=c++17 \
   "$COMMON_A" \
   "$GAMBATTE_A" \
   -s FULL_ES2=1 \
-  -s EXPORTED_RUNTIME_METHODS='["ccall","FS"]' \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8"]' \
   -s EXPORTED_FUNCTIONS="$EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
@@ -107,7 +107,7 @@ em++ -O2 -std=c++17 \
   "$COMMON_A" \
   "$SNES9X_A" \
   -s FULL_ES2=1 \
-  -s EXPORTED_RUNTIME_METHODS='["ccall","FS"]' \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8"]' \
   -s EXPORTED_FUNCTIONS="$EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
@@ -147,7 +147,7 @@ em++ -O2 -std=c++17 \
   "$PCSX_A" \
   -sUSE_ZLIB=1 \
   -s FULL_ES2=1 \
-  -s EXPORTED_RUNTIME_METHODS='["ccall","FS"]' \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8"]' \
   -s EXPORTED_FUNCTIONS="$EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=268435456 \

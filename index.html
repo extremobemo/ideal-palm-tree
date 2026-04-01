@@ -9,6 +9,10 @@
          align-items: center; justify-content: center; height: 100vh; gap: 10px; }
   canvas { display: block; cursor: crosshair; }
   #ui { color: #888; font: 12px monospace; text-align: center; }
+  #mp-bar { color: #888; font: 12px monospace; text-align: center; margin-top: 4px; }
+  #mp-bar button { background:#222; border:1px solid #444; border-radius:4px; color:#ddd;
+                   padding:4px 12px; cursor:pointer; font:12px monospace; }
+  #mp-bar button:hover { background:#333; }
   #overlay {
     position: absolute; inset: 0; display: flex; align-items: center;
     justify-content: center; background: rgba(0,0,0,0.5);
@@ -64,6 +68,13 @@
   </label>
   &nbsp; <span id="status">No ROM loaded</span>
 </div>
+<div id="mp-bar">
+  <button onclick="mpHost()">Host</button>
+  &nbsp;
+  <input id="join-id" placeholder="Peer ID" size="10" style="background:#222;border:1px solid #444;color:#ddd;padding:4px 8px;border-radius:4px;font:12px monospace">
+  <button onclick="mpJoin()">Join</button>
+  &nbsp; <span id="mp-status" style="color:#aaa;font:12px monospace"></span>
+</div>
 
 <script>
 const canvas = document.getElementById('canvas');
@@ -84,6 +95,170 @@ const overlay = document.getElementById('overlay');
   Object.defineProperty(canvas, 'width',  { get: () => w, set: () => {} });
   Object.defineProperty(canvas, 'height', { get: () => h, set: () => {} });
 })();
+
+// ── Multiplayer state ─────────────────────────────────────────
+let frontendGL  = null;   // Emscripten GL table (captured after core loads)
+let frontendCtx = null;   // WebGL1 context of #canvas
+let peerInst    = null;
+let mpConns     = [];     // active DataConnections
+let gameStream  = null;   // MediaStream sent as host
+let mpIsHost    = false;
+
+// Hidden canvas that always holds the latest game frame (for WebRTC video)
+const shareCanvas = document.createElement('canvas');
+shareCanvas.width = 640; shareCanvas.height = 480;
+const shareCtx = shareCanvas.getContext('2d');
+
+function mpSetStatus(msg) {
+  document.getElementById('mp-status').textContent = msg;
+}
+
+// Copy libretro frame from WASM heap → shareCanvas each animation frame.
+// Frames are scaled to fill the full 640×480 shareCanvas so the receiver
+// sees a full-TV image regardless of the core's native resolution.
+const frameTmp = document.createElement('canvas');
+let   frameTmpCtx = null;
+function startFrameCapture() {
+  (function loop() {
+    if (coreModule) {
+      const ptr = coreModule.ccall('get_frame_ptr', 'number', [], []);
+      if (ptr) {
+        const fw = coreModule.ccall('get_frame_w', 'number', [], []);
+        const fh = coreModule.ccall('get_frame_h', 'number', [], []);
+        if (fw > 0 && fh > 0) {
+          // Resize scratch canvas if resolution changed
+          if (frameTmp.width !== fw || frameTmp.height !== fh) {
+            frameTmp.width = fw; frameTmp.height = fh;
+            frameTmpCtx = frameTmp.getContext('2d');
+          }
+          const raw = new Uint8ClampedArray(coreModule.HEAPU8.buffer, ptr, fw * fh * 4);
+          frameTmpCtx.putImageData(new ImageData(new Uint8ClampedArray(raw), fw, fh), 0, 0);
+          // Scale to fill 640×480 for the stream
+          shareCtx.drawImage(frameTmp, 0, 0, 640, 480);
+        }
+      }
+    }
+    requestAnimationFrame(loop);
+  })();
+  gameStream = shareCanvas.captureStream(30);
+}
+
+// Blit received video stream into the TV texture (same pattern as N64)
+function setupVideoReceive(stream) {
+  const videoEl = document.createElement('video');
+  videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true;
+  videoEl.srcObject = stream;
+  videoEl.play().catch(e => console.warn('mp video:', e));
+
+  const texId = coreModule.ccall('get_game_tex_id', 'number', [], []);
+  coreModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
+  (function blitLoop() {
+    if (videoEl.readyState >= 2 && frontendGL && frontendCtx) {
+      const tex = frontendGL.textures[texId];
+      if (tex) {
+        frontendCtx.bindTexture(frontendCtx.TEXTURE_2D, tex);
+        frontendCtx.texImage2D(frontendCtx.TEXTURE_2D, 0,
+          frontendCtx.RGBA, frontendCtx.RGBA, frontendCtx.UNSIGNED_BYTE, videoEl);
+        frontendCtx.texParameteri(frontendCtx.TEXTURE_2D,
+          frontendCtx.TEXTURE_MIN_FILTER, frontendCtx.LINEAR);
+      }
+    }
+    requestAnimationFrame(blitLoop);
+  })();
+}
+
+function startPositionSync(conn) {
+  setInterval(function() {
+    if (!conn.open || !coreModule) return;
+    conn.send({ type: 'pos',
+      x:   coreModule.ccall('get_local_x',   'number', [], []),
+      y:   coreModule.ccall('get_local_y',   'number', [], []),
+      z:   coreModule.ccall('get_local_z',   'number', [], []),
+      yaw: coreModule.ccall('get_local_yaw', 'number', [], [])
+    });
+  }, 50); // 20 Hz
+}
+
+function mpHost() {
+  mpIsHost = true;
+  startFrameCapture();
+  peerInst = new Peer();
+  peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
+  peerInst.on('open', function(id) {
+    mpSetStatus('Your ID: ' + id + '  (share with guest)');
+  });
+  peerInst.on('connection', function(conn) {
+    mpConns.push(conn);
+    const remoteId = mpConns.length - 1;
+    conn.on('open', function() {
+      mpSetStatus('Guest connected');
+      startPositionSync(conn);
+    });
+    conn.on('data', function(data) {
+      if (data.type === 'pos' && coreModule)
+        coreModule.ccall('set_remote_player', 'void',
+          ['number','number','number','number','number'],
+          [remoteId, data.x, data.y, data.z, data.yaw]);
+    });
+    conn.on('close', function() {
+      if (coreModule) coreModule.ccall('remove_remote_player','void',['number'],[remoteId]);
+      mpConns.splice(mpConns.indexOf(conn), 1);
+      mpSetStatus('Guest disconnected');
+    });
+  });
+  peerInst.on('call', function(call) {
+    call.answer(gameStream || new MediaStream());
+  });
+}
+
+function mpJoin() {
+  const hostId = document.getElementById('join-id').value.trim();
+  if (!hostId) { mpSetStatus('Enter a peer ID first'); return; }
+  mpIsHost = false;
+  mpSetStatus('Loading scene...');
+
+  // Guest just needs the 3D room — load game_gbc.js without a ROM
+  loadCore('game_gbc.js', function() {
+    mpSetStatus('Connecting...');
+    peerInst = new Peer();
+    peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
+    peerInst.on('open', function() {
+      // Data channel for positions
+      const conn = peerInst.connect(hostId, { reliable: false });
+      conn.on('open', function() {
+        mpSetStatus('In room with ' + hostId);
+        startPositionSync(conn);
+      });
+      conn.on('data', function(data) {
+        if (data.type === 'pos' && coreModule)
+          coreModule.ccall('set_remote_player', 'void',
+            ['number','number','number','number','number'],
+            [0, data.x, data.y, data.z, data.yaw]);
+      });
+      conn.on('close', function() {
+        if (coreModule) coreModule.ccall('remove_remote_player','void',['number'],[0]);
+        mpSetStatus('Host disconnected');
+      });
+
+      // Video — caller must include a video track in the offer so the SDP has a
+      // video section; otherwise the answerer (host) can't send their stream back.
+      const dummyCanvas = document.createElement('canvas');
+      dummyCanvas.width = 2; dummyCanvas.height = 2;
+      const callStream = dummyCanvas.captureStream
+        ? dummyCanvas.captureStream(1)
+        : new MediaStream();
+      const call = peerInst.call(hostId, callStream);
+      call.on('stream', function(stream) {
+        // Use only the host's video track(s)
+        const vTracks = stream.getVideoTracks();
+        if (!vTracks.length) { mpSetStatus('No video track received'); return; }
+        mpSetStatus('Receiving game from ' + hostId);
+        setupVideoReceive(new MediaStream(vTracks));
+      });
+      call.on('error', e => mpSetStatus('Call error: ' + e));
+    });
+  });
+}
 
 // ── Core routing ──────────────────────────────────────────────
 const CORE_MAP = {
@@ -144,6 +319,10 @@ function loadCore(bundle, callback) {
   injectAndWait(bundle, function(mod) {
     coreModule = mod;
     loadedCore = bundle;
+    if (!frontendGL) {
+      frontendGL  = window.GL;
+      frontendCtx = document.getElementById('canvas').getContext('webgl');
+    }
     callback();
   });
 }
@@ -199,8 +378,10 @@ function loadN64(file) {
     loadedCore = 'game_gbc.js';
 
     // Save game_gbc's GL table NOW before n64wasm can overwrite window.GL
-    var frontendGL  = window.GL;
-    var frontendCtx = document.getElementById('canvas').getContext('webgl');
+    // Use local names that don't shadow the module-level vars, then set both.
+    var n64GL  = window.GL;
+    var n64Ctx = document.getElementById('canvas').getContext('webgl');
+    if (!frontendGL) { frontendGL = n64GL; frontendCtx = n64Ctx; }
     var texId = coreModule.ccall('get_game_tex_id', 'number', [], []);
     // Tell the CRT shader that the game texture is N64-sized, not GBC-sized
     coreModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
@@ -257,17 +438,19 @@ function loadN64(file) {
             var blit2d = blitCanvas.getContext('2d');
             (function copyLoop() {
               if (n64Running) {
-                var tex = frontendGL.textures[texId];
+                var tex = n64GL.textures[texId];
                 if (tex) {
                   blit2d.drawImage(n64canvas, 0, 0);
-                  frontendCtx.bindTexture(frontendCtx.TEXTURE_2D, tex);
-                  frontendCtx.texImage2D(frontendCtx.TEXTURE_2D, 0,
-                    frontendCtx.RGBA, frontendCtx.RGBA,
-                    frontendCtx.UNSIGNED_BYTE, blitCanvas);
-                  frontendCtx.texParameteri(frontendCtx.TEXTURE_2D,
-                    frontendCtx.TEXTURE_MIN_FILTER, frontendCtx.LINEAR);
-                  frontendCtx.texParameteri(frontendCtx.TEXTURE_2D,
-                    frontendCtx.TEXTURE_MAG_FILTER, frontendCtx.LINEAR);
+                  n64Ctx.bindTexture(n64Ctx.TEXTURE_2D, tex);
+                  n64Ctx.texImage2D(n64Ctx.TEXTURE_2D, 0,
+                    n64Ctx.RGBA, n64Ctx.RGBA,
+                    n64Ctx.UNSIGNED_BYTE, blitCanvas);
+                  n64Ctx.texParameteri(n64Ctx.TEXTURE_2D,
+                    n64Ctx.TEXTURE_MIN_FILTER, n64Ctx.LINEAR);
+                  n64Ctx.texParameteri(n64Ctx.TEXTURE_2D,
+                    n64Ctx.TEXTURE_MAG_FILTER, n64Ctx.LINEAR);
+                  // Mirror to shareCanvas for WebRTC streaming (scaled to fill)
+                  shareCtx.drawImage(blitCanvas, 0, 0, 640, 480);
                 }
               }
               requestAnimationFrame(copyLoop);
@@ -408,6 +591,8 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
 });
 </script>
 
+<!-- PeerJS for WebRTC signaling -->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <!-- Core is loaded dynamically based on ROM file extension -->
 </body>
 </html>

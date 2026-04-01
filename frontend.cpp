@@ -79,10 +79,23 @@ struct Player {
     float yaw = 0.f, pitch = 0.f;         // look angles (radians)
 };
 
-static Player g_local;                 // the local player
-// Future: std::vector<Player> g_remote_players;
+static Player g_local;
+
+struct RemotePlayer {
+    float x = 0.f, y = -40.f, z = 0.f;
+    float yaw = 0.f;
+    bool  active = false;
+};
+static RemotePlayer g_remote[8];
+static GLuint g_avatar_vbo = 0, g_avatar_tex = 0;
+static int    g_avatar_vcount = 0;
 
 static bool g_move[4] = {};  // W S A D
+
+// ============================================================
+//  Frame buffer  (exposed to JS for video streaming)
+// ============================================================
+static std::vector<uint8_t> g_frame_rgba;
 
 // ============================================================
 //  CRT pass state
@@ -115,11 +128,11 @@ static void retro_log_cb(retro_log_level, const char* fmt, ...) {
 void retro_video_refresh(const void* data, unsigned w, unsigned h, size_t pitch) {
     if (!data) return;
     g_frame_w = w; g_frame_h = h;
-    std::vector<uint8_t> buf(w*h*4);
+    g_frame_rgba.resize(w*h*4);
     if (g_pixfmt == RETRO_PIXEL_FORMAT_XRGB8888) {
         for (unsigned y=0;y<h;y++) {
             const uint8_t* s=(const uint8_t*)data+y*pitch;
-            uint8_t* d=buf.data()+y*w*4;
+            uint8_t* d=g_frame_rgba.data()+y*w*4;
             for (unsigned x=0;x<w;x++) {
                 d[x*4+0]=s[x*4+2]; d[x*4+1]=s[x*4+1];
                 d[x*4+2]=s[x*4+0]; d[x*4+3]=255;
@@ -128,7 +141,7 @@ void retro_video_refresh(const void* data, unsigned w, unsigned h, size_t pitch)
     } else {
         for (unsigned y=0;y<h;y++) {
             const uint16_t* s=(const uint16_t*)((const uint8_t*)data+y*pitch);
-            uint8_t* d=buf.data()+y*w*4;
+            uint8_t* d=g_frame_rgba.data()+y*w*4;
             for (unsigned x=0;x<w;x++) {
                 uint16_t px=s[x]; uint8_t r,g,b;
                 if (g_pixfmt==RETRO_PIXEL_FORMAT_RGB565) {
@@ -145,7 +158,7 @@ void retro_video_refresh(const void* data, unsigned w, unsigned h, size_t pitch)
         }
     }
     glBindTexture(GL_TEXTURE_2D, g_game_tex);
-    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,buf.data());
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,g_frame_rgba.data());
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
 }
@@ -634,6 +647,44 @@ static void gl_init() {
 
     load_tv();
     init_crt();
+
+    // ── Avatar box mesh (10×30×8, pos+uv+norm = 8 floats / vertex) ──────────
+    {
+        const float hw=5.f, hh=15.f, hd=4.f;
+        std::vector<float> v;
+        auto push = [&](float px,float py,float pz,
+                        float u, float fv,
+                        float nx,float ny,float nz) {
+            v.insert(v.end(),{px,py,pz,u,fv,nx,ny,nz});
+        };
+        auto quad = [&](float nx,float ny,float nz,
+                        float ax,float ay,float az,
+                        float bx,float by,float bz,
+                        float cx,float cy,float cz,
+                        float dx,float dy,float dz) {
+            push(ax,ay,az,0,0,nx,ny,nz); push(bx,by,bz,1,0,nx,ny,nz); push(cx,cy,cz,1,1,nx,ny,nz);
+            push(ax,ay,az,0,0,nx,ny,nz); push(cx,cy,cz,1,1,nx,ny,nz); push(dx,dy,dz,0,1,nx,ny,nz);
+        };
+        quad( 1,0,0,  hw,-hh, hd,  hw, hh, hd,  hw, hh,-hd,  hw,-hh,-hd);
+        quad(-1,0,0, -hw,-hh,-hd, -hw, hh,-hd, -hw, hh, hd, -hw,-hh, hd);
+        quad(0, 1,0, -hw, hh,-hd,  hw, hh,-hd,  hw, hh, hd, -hw, hh, hd);
+        quad(0,-1,0, -hw,-hh, hd,  hw,-hh, hd,  hw,-hh,-hd, -hw,-hh,-hd);
+        quad(0,0, 1, -hw,-hh, hd, -hw, hh, hd,  hw, hh, hd,  hw,-hh, hd);
+        quad(0,0,-1,  hw,-hh,-hd,  hw, hh,-hd, -hw, hh,-hd, -hw,-hh,-hd);
+        g_avatar_vcount = (int)(v.size() / 8);
+        glGenBuffers(1, &g_avatar_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, g_avatar_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size()*sizeof(float)), v.data(), GL_STATIC_DRAW);
+    }
+    // 1×1 cyan texture for avatars
+    {
+        glGenTextures(1, &g_avatar_tex);
+        glBindTexture(GL_TEXTURE_2D, g_avatar_tex);
+        uint8_t cyan[4]={0,190,255,255};
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,cyan);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    }
 }
 
 // ============================================================
@@ -695,6 +746,40 @@ static void render() {
 
         glDrawArrays(GL_TRIANGLES, 0, p.vcount);
     }
+
+    // ── Remote player avatars ────────────────────────────────────────────────
+    if (g_avatar_vbo) {
+        glBindBuffer(GL_ARRAY_BUFFER, g_avatar_vbo);
+        glEnableVertexAttribArray(g_a_pos);
+        glVertexAttribPointer(g_a_pos, 3,GL_FLOAT,GL_FALSE,32,(void*)0);
+        glEnableVertexAttribArray(g_a_uv);
+        glVertexAttribPointer(g_a_uv,  2,GL_FLOAT,GL_FALSE,32,(void*)12);
+        if (g_a_norm>=0) {
+            glEnableVertexAttribArray(g_a_norm);
+            glVertexAttribPointer(g_a_norm,3,GL_FLOAT,GL_FALSE,32,(void*)20);
+        }
+        glUniform1f(g_u_screen, 0.f);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_avatar_tex);
+
+        for (int i=0; i<8; i++) {
+            if (!g_remote[i].active) continue;
+            float c=cosf(g_remote[i].yaw), s=sinf(g_remote[i].yaw);
+            M4 world;
+            // Column-major Y-rotation + translation
+            world[0]=c;   world[1]=0.f; world[2]=-s;  world[3]=0.f;
+            world[4]=0.f; world[5]=1.f; world[6]=0.f; world[7]=0.f;
+            world[8]=s;   world[9]=0.f; world[10]=c;  world[11]=0.f;
+            world[12]=g_remote[i].x;
+            world[13]=g_remote[i].y - 13.f; // center box below eye level
+            world[14]=g_remote[i].z;
+            world[15]=1.f;
+            M4 mvp; m4_mul(mvp, vp, world);
+            glUniformMatrix4fv(g_u_mvp,   1, GL_FALSE, mvp);
+            glUniformMatrix4fv(g_u_model, 1, GL_FALSE, world);
+            glDrawArrays(GL_TRIANGLES, 0, g_avatar_vcount);
+        }
+    }
 }
 
 // ============================================================
@@ -735,6 +820,27 @@ extern "C" EMSCRIPTEN_KEEPALIVE int get_game_tex_id() {
 extern "C" EMSCRIPTEN_KEEPALIVE void set_frame_size(int w, int h) {
     g_frame_w = (unsigned)w;
     g_frame_h = (unsigned)h;
+}
+
+// ── Multiplayer exports ──────────────────────────────────────────────────────
+extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* get_frame_ptr() {
+    return g_frame_rgba.empty() ? nullptr : g_frame_rgba.data();
+}
+extern "C" EMSCRIPTEN_KEEPALIVE int get_frame_w() { return (int)g_frame_w; }
+extern "C" EMSCRIPTEN_KEEPALIVE int get_frame_h() { return (int)g_frame_h; }
+
+extern "C" EMSCRIPTEN_KEEPALIVE float get_local_x()   { return g_local.x; }
+extern "C" EMSCRIPTEN_KEEPALIVE float get_local_y()   { return g_local.y; }
+extern "C" EMSCRIPTEN_KEEPALIVE float get_local_z()   { return g_local.z; }
+extern "C" EMSCRIPTEN_KEEPALIVE float get_local_yaw() { return g_local.yaw; }
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player(int id, float x, float y, float z, float yaw) {
+    if (id < 0 || id >= 8) return;
+    g_remote[id].x = x; g_remote[id].y = y; g_remote[id].z = z;
+    g_remote[id].yaw = yaw; g_remote[id].active = true;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void remove_remote_player(int id) {
+    if (id >= 0 && id < 8) g_remote[id].active = false;
 }
 
 // ============================================================
