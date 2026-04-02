@@ -3,6 +3,8 @@ game.js
 game_gbc.js
 game_snes.js
 game_ps1.js
+game_gbc.data
+game_snes.data
 game_ps1.data
 game_dc.js
 n64wasm.js
