@@ -14,7 +14,7 @@ function mpSetStatus(msg) {
   document.getElementById('mp-status').textContent = msg;
 }
 
-// Broadcast local player position + model to all connected peers at 20 Hz
+// Broadcast local player position + model to all connected peers at 60 Hz
 function startPositionSync(conn) {
   setInterval(function() {
     if (!conn.open || !state.rendererModule) return;
@@ -27,13 +27,47 @@ function startPositionSync(conn) {
       moving: state.rendererModule.ccall('get_local_moving', 'number', [], []),
       model:  state.localModel,
     });
-  }, 50);
+  }, 16);
 }
 
 // Start capturing game frames into shareCanvas for WebRTC streaming.
 // The actual blit happens inside receiveFrame() (libretro) or the N64 copyLoop.
 function startFrameCapture() {
-  gameStream = shareCanvas.captureStream(30);
+  gameStream = shareCanvas.captureStream(60);
+}
+
+// Rewrite SDP to prefer H.264 Baseline (profile-level-id 42e*/4200*).
+// Baseline has no B-frames so every frame decodes immediately — eliminates
+// the 2-3 frame lookahead latency introduced by High profile or VP8 B-frames.
+function preferH264Baseline(sdp) {
+  const lines = sdp.split('\r\n');
+  let basePt = null;
+  for (const line of lines) {
+    const m = line.match(/^a=fmtp:(\d+) .*profile-level-id=42[e8][01f]/i);
+    if (m) { basePt = m[1]; break; }
+  }
+  if (!basePt) return sdp;
+  return lines.map(function(line) {
+    if (!line.startsWith('m=video')) return line;
+    const parts = line.split(' ');
+    const pts   = parts.slice(3);
+    return parts.slice(0, 3).concat([basePt], pts.filter(p => p !== basePt)).join(' ');
+  }).join('\r\n');
+}
+
+// Ask the browser to encode at high priority, 60 fps max, 2.5 Mbps.
+// Called after the peer connection is established so getSenders() is populated.
+function applyLowLatencyEncoding(pc) {
+  pc.getSenders().forEach(function(sender) {
+    if (!sender.track || sender.track.kind !== 'video') return;
+    const p = sender.getParameters();
+    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+    p.encodings[0].maxBitrate      = 2_500_000;
+    p.encodings[0].maxFramerate    = 60;
+    p.encodings[0].priority        = 'high';
+    p.encodings[0].networkPriority = 'high';
+    sender.setParameters(p).catch(e => console.warn('setParameters:', e));
+  });
 }
 
 // Blit a received video stream into the TV texture (guest-side WebRTC receive)
@@ -95,7 +129,10 @@ export function mpHost() {
     });
   });
   peerInst.on('call', function(call) {
-    call.answer(gameStream || new MediaStream());
+    call.answer(gameStream || new MediaStream(), { sdpTransform: preferH264Baseline });
+    call.on('stream', function() {
+      applyLowLatencyEncoding(call.peerConnection);
+    });
   });
 }
 
@@ -135,11 +172,12 @@ export function mpJoin() {
     const callStream = dummyCanvas.captureStream
       ? dummyCanvas.captureStream(1)
       : new MediaStream();
-    const call = peerInst.call(hostId, callStream);
+    const call = peerInst.call(hostId, callStream, { sdpTransform: preferH264Baseline });
     call.on('stream', function(stream) {
       const vTracks = stream.getVideoTracks();
       if (!vTracks.length) { mpSetStatus('No video track received'); return; }
       mpSetStatus('Receiving game from ' + hostId);
+      applyLowLatencyEncoding(call.peerConnection);
       setupVideoReceive(new MediaStream(vTracks));
     });
     call.on('error', e => mpSetStatus('Call error: ' + e));
