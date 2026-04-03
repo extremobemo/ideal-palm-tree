@@ -1,34 +1,33 @@
-// ============================================================
-//  frontend.cpp
-//  Compile with -DRENDERER_ONLY for the main-thread 3D renderer
-//  Compile with -DCORE_ONLY    for a libretro core Web Worker
-// ============================================================
+// renderer.cpp
+// Main-thread 3D room renderer and first-person player.
+// Compiled by build.sh into game_renderer.js (loads once on page open).
+//
+// Responsibilities:
+//   - Parses and uploads glTF scene geometry (TV, room, avatars)
+//   - Runs a 60 Hz WebGL2 render loop: CRT post-process + scene + skinned avatars
+//   - Exposes ~30 EMSCRIPTEN_KEEPALIVE functions for JS to drive lighting, movement, etc.
 
-#ifdef RENDERER_ONLY
-#  define CGLTF_IMPLEMENTATION
-#  define STB_IMAGE_IMPLEMENTATION
-#  include <emscripten.h>
-#  include <emscripten/html5.h>
-#  include <GLES2/gl2.h>
-#  include <cgltf.h>
-#  include <stb_image.h>
-#endif
-
-#ifdef CORE_ONLY
-#  include <emscripten.h>
-#  include <libretro.h>
-#endif
-
+#define CGLTF_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#include <GLES2/gl2.h>
+#include <cgltf.h>
+#include <stb_image.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 
 // ============================================================
-//  Matrix math  (column-major, matches GLSL)  — renderer only
+//  Matrix math  (column-major, matches GLSL layout)
+//
+//  All M4 arrays are stored column-major: element [c*4+r] is column c, row r.
+//  This matches GLSL mat4 layout and lets us pass M4 arrays directly to
+//  glUniformMatrix4fv with transpose=GL_FALSE.
 // ============================================================
-#ifdef RENDERER_ONLY
 typedef float M4[16];
 
 static void m4_identity(M4 m) { memset(m,0,64); m[0]=m[5]=m[10]=m[15]=1.f; }
@@ -50,7 +49,7 @@ static void m4_persp(M4 m, float fov, float asp, float n, float f) {
 
 // Look-at (eye toward target, up=+Y)
 static void m4_lookat(M4 m, float ex,float ey,float ez,
-                              float tx,float ty,float tz) {
+                             float tx,float ty,float tz) {
     float fx=tx-ex, fy=ty-ey, fz=tz-ez;
     float il=1.f/sqrtf(fx*fx+fy*fy+fz*fz);
     fx*=il; fy*=il; fz*=il;
@@ -98,7 +97,17 @@ static void q_slerp(float* out, const float* a, const float* b, float t) {
 }
 
 // ============================================================
-//  GL state  — renderer only
+//  Tuning constants
+// ============================================================
+static constexpr float PLAYER_SPEED       = 0.8f;
+static constexpr float MOUSE_SENSITIVITY  = 0.0025f;
+static constexpr float AVATAR_SCALE       = 0.2f;
+static constexpr float TV_LIGHT_PUSH      = 15.f;
+static constexpr float CONE_POWER_DEFAULT = 18.2f;
+static constexpr float CONE_PITCH_DEFAULT = -362.f;
+
+// ============================================================
+//  GL state
 // ============================================================
 struct TvPrim {
     GLuint vbo;
@@ -113,27 +122,44 @@ static std::vector<TvPrim> g_prims;
 static GLuint g_game_tex   = 0;
 static GLuint g_white_tex  = 0;  // fallback for room prims with no texture
 
-// ── Room transform (tuned at runtime, hardcoded once locked in) ──────────────
-static float g_room_scale = 32.f;
-static float g_room_rot_y = -3.14159265f;   // radians (-180 deg)
-static float g_room_tx = 4.f, g_room_ty = 21.f, g_room_tz = 15.f;
+// ── Lighting state: TV glow + ceiling lamp, updated by JS at runtime ──────────
+struct LightState {
+    float lamp_pos[3]      = {0.f, -45.f, -260.f};
+    float lamp_intensity   = 1.0f;
+    float tv_intensity     = 1.7f;                      // TV emission scale
+    float quad_col[4][3]   = {{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f}};
+    float quad_pos[4][3]   = {};                        // world-space screen quadrant centres
+    float cone_yaw         = 0.f;                       // degrees, rotates cone left/right
+    float cone_pitch       = CONE_PITCH_DEFAULT;        // degrees, tilts cone up/down
+    float cone_power       = CONE_POWER_DEFAULT;        // exponent — higher = tighter cone
+    float screen_normal[3] = {0.f, 0.f, -1.f};         // outward normal of TV screen face
+    float screen_pos[3]    = {};
+    float half_x           = 0.5f;                     // screen local half-extents (from mesh bounds)
+    float half_y           = 0.5f;
+};
+static LightState g_light;
+
+// ── Scene state: room placement + overscan + canvas size cache ────────────────
+struct SceneState {
+    float room_scale  = 32.f;
+    float room_rot_y  = -3.14159265f;   // radians (-180 deg)
+    float room_tx     = 4.f;
+    float room_ty     = 21.f;
+    float room_tz     = 15.f;
+    float overscan_x  = 0.04f;
+    float overscan_y  = 0.04f;
+    int   canvas_w    = 1;              // cached — set once in gl_init(), never changes
+    int   canvas_h    = 1;
+    int   frame_count = 0;             // CRT shader frame counter
+};
+static SceneState g_scene;
+
+// ── GL shader programs + uniform/attribute locations (renderer plumbing) ──────
 static GLuint g_prog     = 0;
 static int    g_a_pos=-1, g_a_uv=-1, g_a_norm=-1;
 static int    g_u_mvp=-1, g_u_model=-1, g_u_tex=-1, g_u_screen=-1, g_u_overscan=-1, g_u_tv_quad_pos=-1, g_u_tv_quad_col=-1, g_u_tv_normal=-1, g_u_lamp_pos=-1, g_u_lamp_intensity=-1;
-static float  g_tv_screen_normal[3] = {0.f, 0.f, -1.f};  // base outward normal
-static float  g_cone_yaw   =    0.f;   // degrees, rotates cone left/right
-static float  g_cone_pitch = -362.f;   // degrees, tilts cone up/down
-static float  g_cone_power =  18.2f;   // exponent — higher = tighter cone
 static int    g_u_cone_power = -1;
 static int    g_skin_u_cone_power = -1;
-static float  g_overscan_x = 0.04f, g_overscan_y = 0.04f;
-static float  g_tv_screen_pos[3] = {0.f, 0.f, 0.f};
-static float  g_tv_quad_pos[4][3] = {};
-static float  g_tv_quad_col[4][3] = {{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f}};
-static float  g_tv_light_intensity = 1.7f;
-static float  g_tv_half_x = 0.5f, g_tv_half_y = 0.5f;
-static float  g_lamp_pos[3] = {0.f, -45.f, -260.f};
-static float  g_lamp_intensity = 1.0f;
 static float  g_cat_eye_height  = -35.f; // camera is at eye level; cat rendered this far below
 
 // ============================================================
@@ -156,6 +182,7 @@ struct RemotePlayer {
     int   model_idx = 0; // 0=cat, 1=incidental_70
 };
 static RemotePlayer g_remote[8];
+
 // ── Cat skinned model ────────────────────────────────────────────────────────
 struct CatChannel {
     int node, path; // path: 0=T, 1=R, 2=S
@@ -186,12 +213,16 @@ struct AvatarModel {
 };
 static AvatarModel g_models[2]; // 0=cat, 1=incidental_70
 static GLuint g_skin_prog  = 0;
-// Shared scratch buffers for animation evaluation (overwritten each frame per player)
-static float  g_cat_bone_mats [CAT_JOINTS][16];
-static float  g_cat_node_t    [CAT_NODES][3];
-static float  g_cat_node_r    [CAT_NODES][4];
-static float  g_cat_node_s    [CAT_NODES][3];
-static float  g_cat_node_global[CAT_NODES][16];
+
+// Scratch buffers for animation evaluation — overwritten each frame per active player
+struct AnimState {
+    float bone_mats [CAT_JOINTS][16];
+    float node_t    [CAT_NODES][3];
+    float node_r    [CAT_NODES][4];
+    float node_s    [CAT_NODES][3];
+    float node_global[CAT_NODES][16];
+};
+static AnimState g_anim;
 static int    g_skin_u_vp=-1, g_skin_u_world=-1, g_skin_u_bones=-1;
 static int    g_skin_u_tex=-1, g_skin_u_tv_quad_pos=-1, g_skin_u_tv_quad_col=-1, g_skin_u_tv_normal=-1;
 static int    g_skin_u_lamp_pos=-1, g_skin_u_lamp_intensity=-1;
@@ -199,13 +230,12 @@ static int    g_skin_a_pos=-1, g_skin_a_uv=-1, g_skin_a_norm=-1;
 static int    g_skin_a_joints=-1, g_skin_a_weights=-1;
 
 static bool g_move[4] = {};  // W S A D
-static bool g_js_colors = false; // true = JS drives quad colors (always true in new arch)
 
 // Frame dimensions — set by set_frame_size() and used by CRT shader uniforms
 static unsigned g_frame_w = 160, g_frame_h = 144;
 
 // ============================================================
-//  CRT pass state  — renderer only
+//  CRT pass state
 // ============================================================
 static GLuint g_crt_fbo  = 0;
 static GLuint g_crt_tex  = 0;
@@ -215,452 +245,15 @@ static int    g_crt_a_vert=-1, g_crt_a_uv=-1;
 static int    g_crt_u_mvp=-1, g_crt_u_fcount=-1;
 static int    g_crt_u_out=-1, g_crt_u_texsz=-1, g_crt_u_insz=-1, g_crt_u_tex=-1;
 static const int CRT_W = 640, CRT_H = 480;
-static int    g_frame_count = 0;
-
-#endif // RENDERER_ONLY
 
 // ============================================================
-//  Core globals  — core only
+//  Shaders
 // ============================================================
-#ifdef CORE_ONLY
-static const int AUDIO_BUF = 16384 * 2;  // int16 units (16384 stereo frames)
-static int16_t   g_audio_buf[AUDIO_BUF];
-static int       g_audio_write = 0;
-static unsigned  g_audio_sample_rate = 44100;
-
-static std::vector<uint8_t> g_frame_rgba;
-static unsigned g_frame_w  = 160, g_frame_h = 144; // updated by retro_video_refresh
-
-static retro_pixel_format g_pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
-static bool     g_running  = false;
-static bool     g_buttons[16] = {};
-#endif // CORE_ONLY
+#include "renderer_shaders.h"
 
 // ============================================================
-//  Libretro callbacks  — core only
+//  Shader + texture helpers
 // ============================================================
-#ifdef CORE_ONLY
-static void retro_log_cb(retro_log_level, const char* fmt, ...) {
-    va_list a; va_start(a,fmt); vprintf(fmt,a); va_end(a);
-}
-
-void retro_video_refresh(const void* data, unsigned w, unsigned h, size_t pitch) {
-    if (!data) return;
-    g_frame_w = w; g_frame_h = h;
-    g_frame_rgba.resize(w*h*4);
-    if (g_pixfmt == RETRO_PIXEL_FORMAT_XRGB8888) {
-        for (unsigned y=0;y<h;y++) {
-            const uint8_t* s=(const uint8_t*)data+y*pitch;
-            uint8_t* d=g_frame_rgba.data()+y*w*4;
-            for (unsigned x=0;x<w;x++) {
-                d[x*4+0]=s[x*4+2]; d[x*4+1]=s[x*4+1];
-                d[x*4+2]=s[x*4+0]; d[x*4+3]=255;
-            }
-        }
-    } else {
-        for (unsigned y=0;y<h;y++) {
-            const uint16_t* s=(const uint16_t*)((const uint8_t*)data+y*pitch);
-            uint8_t* d=g_frame_rgba.data()+y*w*4;
-            for (unsigned x=0;x<w;x++) {
-                uint16_t px=s[x]; uint8_t r,g,b;
-                if (g_pixfmt==RETRO_PIXEL_FORMAT_RGB565) {
-                    r=(px>>11)&0x1F; r=(r<<3)|(r>>2);
-                    g=(px>>5) &0x3F; g=(g<<2)|(g>>4);
-                    b=(px>>0) &0x1F; b=(b<<3)|(b>>2);
-                } else {
-                    r=(px>>10)&0x1F; r=(r<<3)|(r>>2);
-                    g=(px>>5) &0x1F; g=(g<<3)|(g>>2);
-                    b=(px>>0) &0x1F; b=(b<<3)|(b>>2);
-                }
-                d[x*4+0]=r; d[x*4+1]=g; d[x*4+2]=b; d[x*4+3]=255;
-            }
-        }
-    }
-    // No GL calls here — frame is shipped to main thread by core_worker.js
-}
-
-void retro_audio_sample(int16_t l, int16_t r) {
-    g_audio_buf[g_audio_write] = l;
-    g_audio_write = (g_audio_write + 1) % AUDIO_BUF;
-    g_audio_buf[g_audio_write] = r;
-    g_audio_write = (g_audio_write + 1) % AUDIO_BUF;
-}
-size_t retro_audio_sample_batch(const int16_t* data, size_t frames) {
-    for (size_t i = 0; i < frames * 2; i++) {
-        g_audio_buf[g_audio_write] = data[i];
-        g_audio_write = (g_audio_write + 1) % AUDIO_BUF;
-    }
-    return frames;
-}
-void   retro_input_poll() {}
-int16_t retro_input_state(unsigned port,unsigned device,unsigned,unsigned id) {
-    if (port||device!=RETRO_DEVICE_JOYPAD||id>=16) return 0;
-    return g_buttons[id]?1:0;
-}
-bool retro_environment(unsigned cmd, void* data) {
-    switch(cmd) {
-        case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
-            g_pixfmt=*(retro_pixel_format*)data; return true;
-        case RETRO_ENVIRONMENT_GET_CAN_DUPE:
-            *(bool*)data=true; return true;
-        case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
-            *(const char**)data="/system/"; return true;
-        case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
-            *(const char**)data="/saves/"; return true;
-        case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
-            ((retro_log_callback*)data)->log=retro_log_cb; return true;
-        default: return false;
-    }
-}
-#endif // CORE_ONLY
-
-// ============================================================
-//  Shaders  — renderer only
-// ============================================================
-#ifdef RENDERER_ONLY
-static const char* VS = R"(
-attribute vec3 a_pos;
-attribute vec2 a_uv;
-attribute vec3 a_norm;
-uniform mat4 u_mvp;
-uniform mat4 u_model;
-varying vec2 v_uv;
-varying vec3 v_wpos;
-varying vec3 v_wnorm;
-void main() {
-    vec4 wp = u_model * vec4(a_pos, 1.0);
-    gl_Position = u_mvp * vec4(a_pos, 1.0);
-    v_uv   = a_uv;
-    v_wpos = wp.xyz;
-    v_wnorm = normalize(vec3(u_model * vec4(a_norm, 0.0)));
-}
-)";
-
-static const char* FS = R"(
-precision mediump float;
-varying vec2 v_uv;
-varying vec3 v_wpos;
-varying vec3 v_wnorm;
-uniform sampler2D u_tex;
-uniform float u_screen;       // 1.0 = screen (emissive), 0.0 = normal
-uniform vec2  u_overscan;     // per-axis overscan factor
-uniform vec3  u_tv_quad_pos[4]; // world-space centre of each screen quadrant
-uniform vec3  u_tv_quad_col[4]; // averaged colour of each screen quadrant
-uniform vec3  u_tv_normal;      // cone direction (unit)
-uniform float u_cone_power;     // cone falloff exponent
-uniform vec3  u_lamp_pos;
-uniform float u_lamp_intensity;
-
-void main() {
-    if (u_screen > 0.5) {
-        vec2 uv = vec2(1.0 - v_uv.x, v_uv.y);
-        uv = uv * (1.0 - 2.0 * u_overscan) + u_overscan;
-        gl_FragColor = texture2D(u_tex, uv);
-    } else {
-        vec3 n = normalize(v_wnorm);
-        vec3 albedo = texture2D(u_tex, v_uv).rgb;
-
-        // ── Interior ceiling lamp ───────────────────────────────────────────
-        vec3 to_lamp  = u_lamp_pos - v_wpos;
-        float lamp_dist  = length(to_lamp);
-        float lamp_ndotl = max(dot(n, to_lamp / lamp_dist), 0.0);
-        float lamp_atten = 1.0 / (1.0 + lamp_dist * lamp_dist * 0.000022);
-        vec3 lamp = vec3(1.0, 0.84, 0.55) * lamp_ndotl * lamp_atten * u_lamp_intensity;
-
-        // ── TV screen glow: 4 directional quadrant colour-sampled lights ───
-        vec3 tv_glow = vec3(0.0);
-        for (int i = 0; i < 4; i++) {
-            vec3 to_q   = u_tv_quad_pos[i] - v_wpos;
-            float qd    = length(to_q);
-            float ndotl = max(dot(n, to_q / qd), 0.0);
-            float atten = 1.0 / (1.0 + qd * qd * 0.00028);
-            float cone  = max(dot(u_tv_normal, -(to_q / qd)), 0.0);
-            cone        = pow(cone, u_cone_power);
-            tv_glow    += u_tv_quad_col[i] * ndotl * atten * cone * 2.2;
-        }
-
-        // ── Very low warm ambient ───────────────────────────────────────────
-        vec3 ambient = vec3(0.07, 0.052, 0.034);
-
-        gl_FragColor = vec4(albedo * (ambient + lamp + tv_glow), 1.0);
-    }
-}
-)";
-
-// ============================================================
-//  Skinned-mesh shaders (GLSL ES 3.00 / WebGL2)
-// ============================================================
-static const char* SKIN_VS = R"(#version 300 es
-in vec3 a_pos;
-in vec2 a_uv;
-in vec3 a_norm;
-in vec4 a_joints;
-in vec4 a_weights;
-uniform mat4 u_vp;
-uniform mat4 u_world;
-uniform mat4 u_bones[29];
-out vec2 v_uv;
-out vec3 v_wpos;
-out vec3 v_wnorm;
-void main() {
-    mat4 skin = a_weights.x * u_bones[int(a_joints.x)]
-              + a_weights.y * u_bones[int(a_joints.y)]
-              + a_weights.z * u_bones[int(a_joints.z)]
-              + a_weights.w * u_bones[int(a_joints.w)];
-    vec4 wp = u_world * skin * vec4(a_pos, 1.0);
-    gl_Position = u_vp * wp;
-    v_uv    = a_uv;
-    v_wpos  = wp.xyz;
-    v_wnorm = normalize(mat3(u_world) * mat3(skin) * a_norm);
-}
-)";
-
-static const char* SKIN_FS = R"(#version 300 es
-precision mediump float;
-in vec2  v_uv;
-in vec3  v_wpos;
-in vec3  v_wnorm;
-uniform sampler2D u_tex;
-uniform vec3  u_tv_quad_pos[4];
-uniform vec3  u_tv_quad_col[4];
-uniform vec3  u_tv_normal;
-uniform float u_cone_power;
-uniform vec3  u_lamp_pos;
-uniform float u_lamp_intensity;
-out vec4 fragColor;
-void main() {
-    vec3 n = normalize(v_wnorm);
-    vec3 albedo = texture(u_tex, v_uv).rgb;
-    vec3 to_lamp  = u_lamp_pos - v_wpos;
-    float ld = length(to_lamp);
-    float lamp_ndotl = max(dot(n, to_lamp/ld), 0.0);
-    float lamp_atten = 1.0/(1.0+ld*ld*0.000022);
-    vec3 lamp = vec3(1.0,0.84,0.55)*lamp_ndotl*lamp_atten*u_lamp_intensity;
-    vec3 tv_glow = vec3(0.0);
-    for (int i = 0; i < 4; i++) {
-        vec3 to_q   = u_tv_quad_pos[i] - v_wpos;
-        float qd    = length(to_q);
-        float ndotl = max(dot(n, to_q/qd), 0.0);
-        float atten = 1.0/(1.0+qd*qd*0.00028);
-        float cone  = max(dot(u_tv_normal, -(to_q/qd)), 0.0);
-        cone        = pow(cone, u_cone_power);
-        tv_glow    += u_tv_quad_col[i]*ndotl*atten*cone*2.2;
-    }
-    vec3 ambient = vec3(0.07,0.052,0.034);
-    fragColor = vec4(albedo*(ambient+lamp+tv_glow), 1.0);
-}
-)";
-
-// ============================================================
-//  CRT-Geom shaders (adapted for GLSL ES 1.0)
-//  Original: Copyright (C) 2010-2012 cgwg, Themaister and DOLLS (GPL v2+)
-// ============================================================
-static const char* CRT_VS = R"(
-#define CRTgamma 2.4
-#define d 1.6
-#define R 2.0
-#define x_tilt 0.0
-#define y_tilt 0.0
-#define SHARPER 1.0
-
-attribute vec4 VertexCoord;
-attribute vec4 TexCoord;
-uniform mat4 MVPMatrix;
-uniform mediump vec2 OutputSize;
-uniform mediump vec2 TextureSize;
-uniform mediump vec2 InputSize;
-
-varying vec4 TEX0;
-varying vec2 aspect;
-varying vec3 stretch;
-varying vec2 sinangle;
-varying vec2 cosangle;
-varying vec2 one;
-varying float mod_factor;
-varying vec2 ilfac;
-
-#define FIX(c) max(abs(c), 1e-5);
-
-float intersect(vec2 xy) {
-    float A = dot(xy,xy)+d*d;
-    float B = 2.0*(R*(dot(xy,sinangle)-d*cosangle.x*cosangle.y)-d*d);
-    float C = d*d + 2.0*R*d*cosangle.x*cosangle.y;
-    return (-B-sqrt(B*B-4.0*A*C))/(2.0*A);
-}
-vec2 bkwtrans(vec2 xy) {
-    float c = intersect(xy);
-    vec2 pt = vec2(c)*xy;
-    pt -= vec2(-R)*sinangle;
-    pt /= vec2(R);
-    vec2 tang = sinangle/cosangle;
-    vec2 poc = pt/cosangle;
-    float A = dot(tang,tang)+1.0;
-    float B = -2.0*dot(poc,tang);
-    float C = dot(poc,poc)-1.0;
-    float a = (-B+sqrt(B*B-4.0*A*C))/(2.0*A);
-    vec2 uv = (pt-a*sinangle)/cosangle;
-    float r = R*acos(a);
-    return uv*r/sin(r/R);
-}
-vec2 fwtrans(vec2 uv) {
-    float r = FIX(sqrt(dot(uv,uv)));
-    uv *= sin(r/R)/r;
-    float x = 1.0-cos(r/R);
-    float D = d/R + x*cosangle.x*cosangle.y+dot(uv,sinangle);
-    return d*(uv*cosangle-x*sinangle)/D;
-}
-vec3 maxscale() {
-    vec2 c = bkwtrans(-R * sinangle / (1.0 + R/d*cosangle.x*cosangle.y));
-    vec2 a = vec2(0.5)*aspect;
-    vec2 lo = vec2(fwtrans(vec2(-a.x,c.y)).x, fwtrans(vec2(c.x,-a.y)).y)/aspect;
-    vec2 hi = vec2(fwtrans(vec2(+a.x,c.y)).x, fwtrans(vec2(c.x,+a.y)).y)/aspect;
-    return vec3((hi+lo)*aspect*0.5, max(hi.x-lo.x, hi.y-lo.y));
-}
-
-void main() {
-    aspect = vec2(1.0, 0.75);
-    gl_Position = VertexCoord.x*MVPMatrix[0] + VertexCoord.y*MVPMatrix[1]
-                + VertexCoord.z*MVPMatrix[2] + VertexCoord.w*MVPMatrix[3];
-    TEX0.xy = TexCoord.xy * 1.0001;
-    sinangle = sin(vec2(x_tilt, y_tilt)) + vec2(0.001);
-    cosangle = cos(vec2(x_tilt, y_tilt)) + vec2(0.001);
-    stretch = maxscale();
-    ilfac = vec2(1.0, clamp(floor(InputSize.y/200.0), 1.0, 2.0));
-    one = ilfac / vec2(SHARPER * TextureSize.x, TextureSize.y);
-    mod_factor = TexCoord.x * TextureSize.x * OutputSize.x / InputSize.x;
-}
-)";
-
-static const char* CRT_FS = R"(
-#ifdef GL_FRAGMENT_PRECISION_HIGH
-precision highp float;
-#else
-precision mediump float;
-#endif
-
-#define CRTgamma      2.4
-#define monitorgamma  2.2
-#define d             1.6
-#define R             2.0
-#define CURVATURE     1.0
-#define cornersize    0.03
-#define cornersmooth  1000.0
-#define overscan_x    100.0
-#define overscan_y    100.0
-#define DOTMASK       0.3
-#define scanline_weight 0.3
-#define lum           0.0
-#define interlace_detect 1.0
-#define SATURATION    1.0
-
-uniform int FrameCount;
-uniform mediump vec2 OutputSize;
-uniform mediump vec2 TextureSize;
-uniform mediump vec2 InputSize;
-uniform sampler2D Texture;
-
-varying vec4 TEX0;
-varying vec2 aspect;
-varying vec3 stretch;
-varying vec2 sinangle;
-varying vec2 cosangle;
-varying vec2 one;
-varying float mod_factor;
-varying vec2 ilfac;
-
-#define FIX(c) max(abs(c), 1e-5);
-#define PI 3.141592653589
-#define TEX2D(c) pow(texture2D(Texture,(c)), vec4(CRTgamma))
-
-float intersect(vec2 xy) {
-    float A = dot(xy,xy)+d*d;
-    float B = 2.0*(R*(dot(xy,sinangle)-d*cosangle.x*cosangle.y)-d*d);
-    float C = d*d + 2.0*R*d*cosangle.x*cosangle.y;
-    return (-B-sqrt(B*B-4.0*A*C))/(2.0*A);
-}
-vec2 bkwtrans(vec2 xy) {
-    float c = intersect(xy);
-    vec2 pt = vec2(c)*xy;
-    pt -= vec2(-R)*sinangle;
-    pt /= vec2(R);
-    vec2 tang = sinangle/cosangle;
-    vec2 poc = pt/cosangle;
-    float A = dot(tang,tang)+1.0;
-    float B = -2.0*dot(poc,tang);
-    float C = dot(poc,poc)-1.0;
-    float a = (-B+sqrt(B*B-4.0*A*C))/(2.0*A);
-    vec2 uv = (pt-a*sinangle)/cosangle;
-    float r = FIX(R*acos(a));
-    return uv*r/sin(r/R);
-}
-vec2 transform(vec2 coord) {
-    coord *= TextureSize / InputSize;
-    coord = (coord-vec2(0.5))*aspect*stretch.z + stretch.xy;
-    return (bkwtrans(coord)/vec2(overscan_x/100.0, overscan_y/100.0)/aspect+vec2(0.5))*InputSize/TextureSize;
-}
-float corner(vec2 coord) {
-    coord *= TextureSize / InputSize;
-    coord = (coord-vec2(0.5))*vec2(overscan_x/100.0, overscan_y/100.0)+vec2(0.5);
-    coord = min(coord, vec2(1.0)-coord)*aspect;
-    vec2 cdist = vec2(cornersize);
-    coord = cdist - min(coord, cdist);
-    float dist = sqrt(dot(coord,coord));
-    return clamp((cdist.x-dist)*cornersmooth, 0.0, 1.0)*1.0001;
-}
-vec4 scanlineWeights(float distance, vec4 color) {
-    vec4 wid = 2.0 + 2.0*pow(color, vec4(4.0));
-    vec4 weights = vec4(distance / scanline_weight);
-    return (lum+1.4)*exp(-pow(weights*inversesqrt(0.5*wid),wid))/(0.6+0.2*wid);
-}
-vec3 inv_gamma(vec3 col, vec3 power) {
-    vec3 cir = col-1.0; cir *= cir;
-    return mix(sqrt(col), sqrt(1.0-cir), power);
-}
-
-void main() {
-    vec2 xy = transform(TEX0.xy);
-    float cval = corner(xy);
-
-    vec2 ilvec = vec2(0.0, ilfac.y*interlace_detect > 1.5 ? mod(float(FrameCount),2.0) : 0.0);
-    vec2 ratio_scale = (xy*TextureSize - vec2(0.5) + ilvec) / ilfac;
-    float filter_ = InputSize.y / OutputSize.y;
-    vec2 uv_ratio = fract(ratio_scale);
-    xy = (floor(ratio_scale)*ilfac + vec2(0.5) - ilvec) / TextureSize;
-
-    vec4 coeffs = PI * vec4(1.0+uv_ratio.x, uv_ratio.x, 1.0-uv_ratio.x, 2.0-uv_ratio.x);
-    coeffs = FIX(coeffs);
-    coeffs = 2.0*sin(coeffs)*sin(coeffs/2.0)/(coeffs*coeffs);
-    coeffs /= dot(coeffs, vec4(1.0));
-
-    vec4 col  = clamp(mat4(TEX2D(xy+vec2(-one.x,0.0)), TEX2D(xy),
-                           TEX2D(xy+vec2(one.x,0.0)),  TEX2D(xy+vec2(2.0*one.x,0.0)))*coeffs, 0.0,1.0);
-    vec4 col2 = clamp(mat4(TEX2D(xy+vec2(-one.x,one.y)), TEX2D(xy+vec2(0.0,one.y)),
-                           TEX2D(xy+one),                TEX2D(xy+vec2(2.0*one.x,one.y)))*coeffs, 0.0,1.0);
-
-    vec4 weights  = scanlineWeights(uv_ratio.y, col);
-    vec4 weights2 = scanlineWeights(1.0-uv_ratio.y, col2);
-    uv_ratio.y += 1.0/3.0*filter_;
-    weights  = (weights  + scanlineWeights(uv_ratio.y, col))  / 3.0;
-    weights2 = (weights2 + scanlineWeights(abs(1.0-uv_ratio.y), col2)) / 3.0;
-    uv_ratio.y -= 2.0/3.0*filter_;
-    weights  += scanlineWeights(abs(uv_ratio.y), col)  / 3.0;
-    weights2 += scanlineWeights(abs(1.0-uv_ratio.y), col2) / 3.0;
-
-    vec3 mul_res = (col*weights + col2*weights2).rgb * vec3(cval);
-
-    mul_res *= mix(vec3(1.0,1.0-DOTMASK,1.0), vec3(1.0-DOTMASK,1.0,1.0-DOTMASK),
-                   floor(mod(mod_factor, 2.0)));
-
-    vec3 pwr = vec3(1.0/((-0.7*(1.0-scanline_weight)+1.0)*(-0.5*DOTMASK+1.0))-1.25);
-    mul_res = inv_gamma(mul_res, pwr);
-
-    float luma = dot(mul_res, vec3(0.3,0.6,0.1));
-    mul_res = mix(vec3(luma), mul_res, SATURATION);
-
-    gl_FragColor = vec4(mul_res, 1.0);
-}
-)";
-
 static GLuint make_shader(GLenum type, const char* src) {
     GLuint s=glCreateShader(type);
     glShaderSource(s,1,&src,nullptr); glCompileShader(s);
@@ -669,9 +262,6 @@ static GLuint make_shader(GLenum type, const char* src) {
     return s;
 }
 
-// ============================================================
-//  Texture loading (stb_image)
-// ============================================================
 static GLuint load_tex(const char* path) {
     int w,h,ch;
     uint8_t* px=stbi_load(path,&w,&h,&ch,4);
@@ -711,7 +301,7 @@ static GLuint load_tex_bv(cgltf_buffer_view* bv) {
 }
 
 // ============================================================
-//  GLTF loader
+//  GLTF loaders
 // ============================================================
 static void load_tv() {
     cgltf_options opts = {};
@@ -753,6 +343,8 @@ static void load_tv() {
             glBufferData(GL_ARRAY_BUFFER, bv->size, bv_data, GL_STATIC_DRAW);
 
             // Material → is it the screen?
+            // Screen detection: primitive material named "TVScreen" receives the game texture.
+            // All other materials receive their own base colour texture (or g_white_tex).
             bool is_screen = false;
             GLuint base_tex = 0;
             if (prim->material && prim->material->name) {
@@ -775,9 +367,9 @@ static void load_tv() {
                     if(p[0]<mn_x)mn_x=p[0]; if(p[0]>mx_x)mx_x=p[0];
                     if(p[1]<mn_y)mn_y=p[1]; if(p[1]>mx_y)mx_y=p[1];
                 }
-                g_tv_half_x = (mx_x-mn_x)*0.5f;
-                g_tv_half_y = (mx_y-mn_y)*0.5f;
-                printf("Screen local half-extents: %.3f x %.3f\n", g_tv_half_x, g_tv_half_y);
+                g_light.half_x = (mx_x-mn_x)*0.5f;
+                g_light.half_y = (mx_y-mn_y)*0.5f;
+                printf("Screen local half-extents: %.3f x %.3f\n", g_light.half_x, g_light.half_y);
             }
 
             TvPrim tp;
@@ -1129,7 +721,7 @@ static void render_crt_pass() {
     M4 identity; m4_identity(identity);
     glUseProgram(g_crt_prog);
     glUniformMatrix4fv(g_crt_u_mvp,    1, GL_FALSE, identity);
-    glUniform1i(g_crt_u_fcount, g_frame_count++);
+    glUniform1i(g_crt_u_fcount, g_scene.frame_count++);
     glUniform2f(g_crt_u_out,   (float)CRT_W, (float)CRT_H);
     glUniform2f(g_crt_u_texsz, (float)g_frame_w, (float)g_frame_h);
     glUniform2f(g_crt_u_insz,  (float)g_frame_w, (float)g_frame_h);
@@ -1193,32 +785,31 @@ static void gl_init() {
     load_tv();
     for (const auto& p : g_prims)
         if (p.is_screen) {
-            g_tv_screen_pos[0] = p.world[12];
-            g_tv_screen_pos[1] = p.world[13];
-            g_tv_screen_pos[2] = p.world[14];
+            g_light.screen_pos[0] = p.world[12];
+            g_light.screen_pos[1] = p.world[13];
+            g_light.screen_pos[2] = p.world[14];
             printf("TV screen world pos: %.2f %.2f %.2f\n", p.world[12], p.world[13], p.world[14]);
             // World-space half-extent vectors (col 0 = local X, col 1 = local Y)
-            float rx=p.world[0]*g_tv_half_x, ry=p.world[1]*g_tv_half_x, rz=p.world[2]*g_tv_half_x;
-            float ux=p.world[4]*g_tv_half_y, uy=p.world[5]*g_tv_half_y, uz=p.world[6]*g_tv_half_y;
+            float rx=p.world[0]*g_light.half_x, ry=p.world[1]*g_light.half_x, rz=p.world[2]*g_light.half_x;
+            float ux=p.world[4]*g_light.half_y, uy=p.world[5]*g_light.half_y, uz=p.world[6]*g_light.half_y;
             // quadrant centres: q0=(-r,-u), q1=(+r,-u), q2=(-r,+u), q3=(+r,+u)
             const float sgn[4][2] = {{-1,-1},{1,-1},{-1,1},{1,1}};
             for (int q=0;q<4;q++) {
-                g_tv_quad_pos[q][0] = g_tv_screen_pos[0] + sgn[q][0]*rx*0.5f + sgn[q][1]*ux*0.5f;
-                g_tv_quad_pos[q][1] = g_tv_screen_pos[1] + sgn[q][0]*ry*0.5f + sgn[q][1]*uy*0.5f;
-                g_tv_quad_pos[q][2] = g_tv_screen_pos[2] + sgn[q][0]*rz*0.5f + sgn[q][1]*uz*0.5f;
+                g_light.quad_pos[q][0] = g_light.screen_pos[0] + sgn[q][0]*rx*0.5f + sgn[q][1]*ux*0.5f;
+                g_light.quad_pos[q][1] = g_light.screen_pos[1] + sgn[q][0]*ry*0.5f + sgn[q][1]*uy*0.5f;
+                g_light.quad_pos[q][2] = g_light.screen_pos[2] + sgn[q][0]*rz*0.5f + sgn[q][1]*uz*0.5f;
             }
             // Push lights out toward the viewer (player start position).
-            float nx = 0.f         - g_tv_screen_pos[0];
-            float ny = 20.f        - g_tv_screen_pos[1]; // player eye-level
-            float nz = -80.f       - g_tv_screen_pos[2]; // player start Z
+            float nx = 0.f         - g_light.screen_pos[0];
+            float ny = 20.f        - g_light.screen_pos[1]; // player eye-level
+            float nz = -80.f       - g_light.screen_pos[2]; // player start Z
             float nl = sqrtf(nx*nx + ny*ny + nz*nz);
             if (nl > 0.f) { nx/=nl; ny/=nl; nz/=nl; }
-            g_tv_screen_normal[0]=nx; g_tv_screen_normal[1]=ny; g_tv_screen_normal[2]=nz;
-            const float push = 15.f;
+            g_light.screen_normal[0]=nx; g_light.screen_normal[1]=ny; g_light.screen_normal[2]=nz;
             for (int q=0;q<4;q++) {
-                g_tv_quad_pos[q][0] += nx*push;
-                g_tv_quad_pos[q][1] += ny*push;
-                g_tv_quad_pos[q][2] += nz*push;
+                g_light.quad_pos[q][0] += nx*TV_LIGHT_PUSH;
+                g_light.quad_pos[q][1] += ny*TV_LIGHT_PUSH;
+                g_light.quad_pos[q][2] += nz*TV_LIGHT_PUSH;
             }
             printf("Screen outward normal: %.3f %.3f %.3f\n", nx, ny, nz);
         }
@@ -1236,45 +827,54 @@ static void gl_init() {
     }
     load_cat();
     load_incidental();
+    // Cache canvas pixel dimensions — the JS side locks canvas size after init,
+    // so this is called once here rather than inside every render() frame.
+    emscripten_get_canvas_element_size("#canvas", &g_scene.canvas_w, &g_scene.canvas_h);
 }
 
 // ============================================================
 //  Render
 // ============================================================
+
+// Sample a glTF skeletal animation at anim_time and write the resulting bone
+// matrices into g_anim.bone_mats[].  Each bone matrix = global_transform *
+// inverse_bind_matrix, ready to be uploaded as a GLSL mat4 array uniform.
+// Keyframe interpolation: linear for translation/scale, quaternion slerp for rotation.
 static void update_anim(AvatarModel* mdl, int anim_idx, float anim_time) {
     if (mdl->anims.empty() || anim_idx < 0 || anim_idx >= (int)mdl->anims.size()) return;
     CatAnim& anim = mdl->anims[anim_idx];
 
     // Reset to default pose
     for (int ni=0;ni<mdl->node_count;ni++){
-        memcpy(g_cat_node_t[ni],mdl->node_def_t[ni],12);
-        memcpy(g_cat_node_r[ni],mdl->node_def_r[ni],16);
-        memcpy(g_cat_node_s[ni],mdl->node_def_s[ni],12);
+        memcpy(g_anim.node_t[ni],mdl->node_def_t[ni],12);
+        memcpy(g_anim.node_r[ni],mdl->node_def_r[ni],16);
+        memcpy(g_anim.node_s[ni],mdl->node_def_s[ni],12);
     }
 
     // Sample channels
     for (const CatChannel& ch : anim.channels) {
         int n=ch.node; if(n<0||n>=mdl->node_count) continue;
         int kc=(int)ch.times.size(); if(kc==0) continue;
-        int lo=kc-1;
-        for(int k=0;k<kc;k++){ if(ch.times[k]>anim_time){lo=k-1;break;} }
-        if(lo<0)lo=0;
+        // Binary search: last keyframe with time <= anim_time
+        auto it = std::upper_bound(ch.times.begin(), ch.times.end(), anim_time);
+        int lo = (int)(it - ch.times.begin()) - 1;
+        if (lo < 0) lo = 0;
         int hi=(lo+1<kc)?lo+1:lo;
         float t=0.f;
         if(hi!=lo) t=(anim_time-ch.times[lo])/(ch.times[hi]-ch.times[lo]);
         if(t<0.f)t=0.f; if(t>1.f)t=1.f;
         if(ch.path==0){
             const float*a=&ch.values[lo*3],*b=&ch.values[hi*3];
-            g_cat_node_t[n][0]=a[0]+(b[0]-a[0])*t;
-            g_cat_node_t[n][1]=a[1]+(b[1]-a[1])*t;
-            g_cat_node_t[n][2]=a[2]+(b[2]-a[2])*t;
+            g_anim.node_t[n][0]=a[0]+(b[0]-a[0])*t;
+            g_anim.node_t[n][1]=a[1]+(b[1]-a[1])*t;
+            g_anim.node_t[n][2]=a[2]+(b[2]-a[2])*t;
         } else if(ch.path==1){
-            q_slerp(g_cat_node_r[n],&ch.values[lo*4],&ch.values[hi*4],t);
+            q_slerp(g_anim.node_r[n],&ch.values[lo*4],&ch.values[hi*4],t);
         } else {
             const float*a=&ch.values[lo*3],*b=&ch.values[hi*3];
-            g_cat_node_s[n][0]=a[0]+(b[0]-a[0])*t;
-            g_cat_node_s[n][1]=a[1]+(b[1]-a[1])*t;
-            g_cat_node_s[n][2]=a[2]+(b[2]-a[2])*t;
+            g_anim.node_s[n][0]=a[0]+(b[0]-a[0])*t;
+            g_anim.node_s[n][1]=a[1]+(b[1]-a[1])*t;
+            g_anim.node_s[n][2]=a[2]+(b[2]-a[2])*t;
         }
     }
 
@@ -1287,9 +887,9 @@ static void update_anim(AvatarModel* mdl, int anim_idx, float anim_time) {
             if(done[ni]) continue;
             int p=mdl->node_parent[ni];
             if(p>=0&&!done[p]) continue;
-            M4 local; m4_from_trs(local,g_cat_node_t[ni],g_cat_node_r[ni],g_cat_node_s[ni]);
-            if(p<0) memcpy(g_cat_node_global[ni],local,64);
-            else    m4_mul(g_cat_node_global[ni],g_cat_node_global[p],local);
+            M4 local; m4_from_trs(local,g_anim.node_t[ni],g_anim.node_r[ni],g_anim.node_s[ni]);
+            if(p<0) memcpy(g_anim.node_global[ni],local,64);
+            else    m4_mul(g_anim.node_global[ni],g_anim.node_global[p],local);
             done[ni]=true; left--;
         }
         if(left==prev) break;
@@ -1297,13 +897,13 @@ static void update_anim(AvatarModel* mdl, int anim_idx, float anim_time) {
 
     // Compute bone matrices = global[joint] * inv_bind[j]
     for(int j=0;j<mdl->joint_count;j++){
-        M4 bone; m4_mul(bone, g_cat_node_global[mdl->joint_nodes[j]], mdl->inv_bind[j]);
-        memcpy(g_cat_bone_mats[j],bone,64);
+        M4 bone; m4_mul(bone, g_anim.node_global[mdl->joint_nodes[j]], mdl->inv_bind[j]);
+        memcpy(g_anim.bone_mats[j],bone,64);
     }
 }
 
 static void update_player() {
-    const float speed = 0.8f;
+    const float speed = PLAYER_SPEED;
     float fw_x = sinf(g_local.yaw);
     float fw_z = cosf(g_local.yaw);
     float rt_x = cosf(g_local.yaw);
@@ -1315,61 +915,33 @@ static void update_player() {
     if (g_move[3]) { g_local.x += rt_x*speed; g_local.z += rt_z*speed; } // D
 }
 
-static void render() {
-    int w,h;
-    emscripten_get_canvas_element_size("#canvas",&w,&h);
-    glViewport(0,0,w,h);
-    glClearColor(0.35f,0.35f,0.35f,1.f);
-    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
-
-    // First-person camera from local player
-    // g_local.y is feet/floor position; g_cat_eye_height lifts camera to head level
-    float eye_y = g_local.y + g_cat_eye_height;
-    float tx = g_local.x + cosf(g_local.pitch) * sinf(g_local.yaw);
-    float ty = eye_y + sinf(g_local.pitch);
-    float tz = g_local.z + cosf(g_local.pitch) * cosf(g_local.yaw);
-
-    M4 proj, view, vp;
-    m4_persp(proj, 1.0f, (float)w/h, 0.5f, 1000.f);
-    m4_lookat(view, g_local.x, eye_y, g_local.z, tx, ty, tz);
-    m4_mul(vp, proj, view);
-
+// ── Static geometry pass (TV body + room models) ──────────────────────────────
+static void render_scene(const M4 vp, const float scaled_col[4][3], const float cone_dir[3]) {
     glUseProgram(g_prog);
     glUniform1i(g_u_tex, 0);
-    glUniform2f(g_u_overscan, g_overscan_x, g_overscan_y);
-    float scaled_col[4][3];
-    for (int q=0;q<4;q++) for (int k=0;k<3;k++)
-        scaled_col[q][k] = g_tv_quad_col[q][k] * g_tv_light_intensity;
-    // Rotate base screen normal by yaw (Y-axis) and pitch (X-axis)
-    float yaw_r   = g_cone_yaw   * 3.14159265f / 180.f;
-    float pitch_r = g_cone_pitch * 3.14159265f / 180.f;
-    float cy=cosf(yaw_r), sy=sinf(yaw_r);
-    float bn0=g_tv_screen_normal[0], bn1=g_tv_screen_normal[1], bn2=g_tv_screen_normal[2];
-    float n0= cy*bn0 + sy*bn2, n1=bn1, n2=-sy*bn0 + cy*bn2; // yaw
-    float cp=cosf(pitch_r), sp=sinf(pitch_r);
-    float cone_dir[3] = { n0, cp*n1 - sp*n2, sp*n1 + cp*n2 }; // pitch
-    glUniform3fv(g_u_tv_quad_pos, 4, &g_tv_quad_pos[0][0]);
+    glUniform2f(g_u_overscan, g_scene.overscan_x, g_scene.overscan_y);
+    glUniform3fv(g_u_tv_quad_pos, 4, &g_light.quad_pos[0][0]);
     glUniform3fv(g_u_tv_quad_col, 4, &scaled_col[0][0]);
     glUniform3fv(g_u_tv_normal,   1, cone_dir);
-    glUniform1f (g_u_cone_power,  g_cone_power);
-    glUniform3fv(g_u_lamp_pos,       1, g_lamp_pos);
-    glUniform1f (g_u_lamp_intensity, g_lamp_intensity);
+    glUniform1f (g_u_cone_power,  g_light.cone_power);
+    glUniform3fv(g_u_lamp_pos,       1, g_light.lamp_pos);
+    glUniform1f (g_u_lamp_intensity, g_light.lamp_intensity);
 
-    // Pre-build room parent matrix from live tuning params (scale + Y-rot + translate)
-    M4 g_room_parent;
+    // Room parent matrix from live tuning params (scale + Y-rot + translate)
+    M4 room_parent;
     {
-        float s = g_room_scale;
-        float c = cosf(g_room_rot_y), sr = sinf(g_room_rot_y);
-        g_room_parent[0] = s*c;  g_room_parent[1] = 0.f; g_room_parent[2] =-s*sr; g_room_parent[3] = 0.f;
-        g_room_parent[4] = 0.f;  g_room_parent[5] = s;   g_room_parent[6] = 0.f;  g_room_parent[7] = 0.f;
-        g_room_parent[8] = s*sr; g_room_parent[9] = 0.f; g_room_parent[10]= s*c;  g_room_parent[11]= 0.f;
-        g_room_parent[12]= g_room_tx; g_room_parent[13]= g_room_ty;
-        g_room_parent[14]= g_room_tz; g_room_parent[15]= 1.f;
+        float s = g_scene.room_scale;
+        float c = cosf(g_scene.room_rot_y), sr = sinf(g_scene.room_rot_y);
+        room_parent[0] = s*c;  room_parent[1] = 0.f; room_parent[2] =-s*sr; room_parent[3] = 0.f;
+        room_parent[4] = 0.f;  room_parent[5] = s;   room_parent[6] = 0.f;  room_parent[7] = 0.f;
+        room_parent[8] = s*sr; room_parent[9] = 0.f; room_parent[10]= s*c;  room_parent[11]= 0.f;
+        room_parent[12]= g_scene.room_tx; room_parent[13]= g_scene.room_ty;
+        room_parent[14]= g_scene.room_tz; room_parent[15]= 1.f;
     }
 
     for (auto& p : g_prims) {
         M4 world, mvp;
-        if (p.is_room) { m4_mul(world, g_room_parent, p.world); }
+        if (p.is_room) { m4_mul(world, room_parent, p.world); }
         else           { memcpy(world, p.world, sizeof(M4)); }
         m4_mul(mvp, vp, world);
         glUniformMatrix4fv(g_u_mvp,   1, GL_FALSE, mvp);
@@ -1395,87 +967,117 @@ static void render() {
         glDrawArrays(GL_TRIANGLES, 0, p.vcount);
         if (p.double_sided) glEnable(GL_CULL_FACE);
     }
-
-    // ── Remote player avatar models ──────────────────────────────────────────
-    if (g_skin_prog) {
-        glUseProgram(g_skin_prog);
-        glUniform1i(g_skin_u_tex, 0);
-        glActiveTexture(GL_TEXTURE0);
-        glUniform3fv(g_skin_u_tv_quad_pos, 4, &g_tv_quad_pos[0][0]);
-        glUniform3fv(g_skin_u_tv_quad_col, 4, &scaled_col[0][0]);
-        glUniform3fv(g_skin_u_tv_normal,   1, cone_dir);
-        glUniform1f (g_skin_u_cone_power,  g_cone_power);
-        glUniform3fv(g_skin_u_lamp_pos, 1, g_lamp_pos);
-        glUniform1f (g_skin_u_lamp_intensity, g_lamp_intensity);
-
-        glDisable(GL_CULL_FACE);
-
-        if(g_skin_a_pos>=0)    glEnableVertexAttribArray(g_skin_a_pos);
-        if(g_skin_a_uv>=0)     glEnableVertexAttribArray(g_skin_a_uv);
-        if(g_skin_a_norm>=0)   glEnableVertexAttribArray(g_skin_a_norm);
-        if(g_skin_a_joints>=0) glEnableVertexAttribArray(g_skin_a_joints);
-        if(g_skin_a_weights>=0)glEnableVertexAttribArray(g_skin_a_weights);
-
-        for (int i=0; i<8; i++) {
-            if (!g_remote[i].active) continue;
-            AvatarModel* mdl = &g_models[g_remote[i].model_idx];
-            if (!mdl->loaded || !mdl->vbo || mdl->meshes.empty()) continue;
-
-            // Advance animation, switching between idle and walk
-            int target = g_remote[i].moving ? mdl->walk_anim : mdl->idle_anim;
-            if (g_remote[i].anim_idx != target) {
-                g_remote[i].anim_idx  = target;
-                g_remote[i].anim_time = 0.f;
-            }
-            if (g_remote[i].anim_idx < (int)mdl->anims.size()) {
-                float dur = mdl->anims[g_remote[i].anim_idx].duration;
-                if (dur > 0.f) g_remote[i].anim_time = fmodf(g_remote[i].anim_time + 1.f/60.f, dur);
-            }
-            update_anim(mdl, g_remote[i].anim_idx, g_remote[i].anim_time);
-
-            glUniformMatrix4fv(g_skin_u_vp,    1, GL_FALSE, vp);
-            glUniformMatrix4fv(g_skin_u_bones, mdl->joint_count, GL_FALSE, &g_cat_bone_mats[0][0]);
-
-            float c=cosf(g_remote[i].yaw), s=sinf(g_remote[i].yaw);
-            float sc=0.2f;
-            M4 world;
-            world[0]=c*sc; world[1]=0.f;  world[2]=-s*sc; world[3]=0.f;
-            world[4]=0.f;  world[5]=-sc;  world[6]=0.f;   world[7]=0.f;
-            world[8]=s*sc; world[9]=0.f;  world[10]=c*sc; world[11]=0.f;
-            world[12]=g_remote[i].x; world[13]=g_remote[i].y; world[14]=g_remote[i].z; world[15]=1.f;
-            glUniformMatrix4fv(g_skin_u_world, 1, GL_FALSE, world);
-
-            glBindBuffer(GL_ARRAY_BUFFER, mdl->vbo);
-            if(g_skin_a_pos>=0)    glVertexAttribPointer(g_skin_a_pos,    3,GL_FLOAT,GL_FALSE,64,(void*)0);
-            if(g_skin_a_uv>=0)     glVertexAttribPointer(g_skin_a_uv,     2,GL_FLOAT,GL_FALSE,64,(void*)12);
-            if(g_skin_a_norm>=0)   glVertexAttribPointer(g_skin_a_norm,   3,GL_FLOAT,GL_FALSE,64,(void*)20);
-            if(g_skin_a_joints>=0) glVertexAttribPointer(g_skin_a_joints, 4,GL_FLOAT,GL_FALSE,64,(void*)32);
-            if(g_skin_a_weights>=0)glVertexAttribPointer(g_skin_a_weights,4,GL_FLOAT,GL_FALSE,64,(void*)48);
-
-            for (const auto& am : mdl->meshes) {
-                glBindTexture(GL_TEXTURE_2D, am.tex);
-                glDrawArrays(GL_TRIANGLES, am.start, am.count);
-            }
-        }
-
-        if(g_skin_a_pos>=0)    glDisableVertexAttribArray(g_skin_a_pos);
-        if(g_skin_a_uv>=0)     glDisableVertexAttribArray(g_skin_a_uv);
-        if(g_skin_a_norm>=0)   glDisableVertexAttribArray(g_skin_a_norm);
-        if(g_skin_a_joints>=0) glDisableVertexAttribArray(g_skin_a_joints);
-        if(g_skin_a_weights>=0)glDisableVertexAttribArray(g_skin_a_weights);
-
-        glEnable(GL_CULL_FACE);
-    }
 }
 
-#endif // RENDERER_ONLY
+// ── Skinned remote player avatars ────────────────────────────────────────────
+static void render_avatars(const M4 vp, const float scaled_col[4][3], const float cone_dir[3]) {
+    if (!g_skin_prog) return;
+
+    glUseProgram(g_skin_prog);
+    glUniform1i(g_skin_u_tex, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform3fv(g_skin_u_tv_quad_pos, 4, &g_light.quad_pos[0][0]);
+    glUniform3fv(g_skin_u_tv_quad_col, 4, &scaled_col[0][0]);
+    glUniform3fv(g_skin_u_tv_normal,   1, cone_dir);
+    glUniform1f (g_skin_u_cone_power,  g_light.cone_power);
+    glUniform3fv(g_skin_u_lamp_pos, 1, g_light.lamp_pos);
+    glUniform1f (g_skin_u_lamp_intensity, g_light.lamp_intensity);
+
+    glDisable(GL_CULL_FACE);
+
+    if(g_skin_a_pos>=0)    glEnableVertexAttribArray(g_skin_a_pos);
+    if(g_skin_a_uv>=0)     glEnableVertexAttribArray(g_skin_a_uv);
+    if(g_skin_a_norm>=0)   glEnableVertexAttribArray(g_skin_a_norm);
+    if(g_skin_a_joints>=0) glEnableVertexAttribArray(g_skin_a_joints);
+    if(g_skin_a_weights>=0)glEnableVertexAttribArray(g_skin_a_weights);
+
+    for (int i=0; i<8; i++) {
+        if (!g_remote[i].active) continue;
+        AvatarModel* mdl = &g_models[g_remote[i].model_idx];
+        if (!mdl->loaded || !mdl->vbo || mdl->meshes.empty()) continue;
+
+        // Advance animation, switching between idle and walk
+        int target = g_remote[i].moving ? mdl->walk_anim : mdl->idle_anim;
+        if (g_remote[i].anim_idx != target) {
+            g_remote[i].anim_idx  = target;
+            g_remote[i].anim_time = 0.f;
+        }
+        if (g_remote[i].anim_idx < (int)mdl->anims.size()) {
+            float dur = mdl->anims[g_remote[i].anim_idx].duration;
+            if (dur > 0.f) g_remote[i].anim_time = fmodf(g_remote[i].anim_time + 1.f/60.f, dur);
+        }
+        update_anim(mdl, g_remote[i].anim_idx, g_remote[i].anim_time);
+
+        glUniformMatrix4fv(g_skin_u_vp, 1, GL_FALSE, vp);
+        if (mdl->joint_count > 0)
+            glUniformMatrix4fv(g_skin_u_bones, mdl->joint_count, GL_FALSE, &g_anim.bone_mats[0][0]);
+
+        float c=cosf(g_remote[i].yaw), s=sinf(g_remote[i].yaw);
+        float sc = AVATAR_SCALE * (g_remote[i].model_idx == 1 ? 1.75f : 1.0f);
+        M4 world;
+        world[0]=c*sc; world[1]=0.f;  world[2]=-s*sc; world[3]=0.f;
+        world[4]=0.f;  world[5]=-sc;  world[6]=0.f;   world[7]=0.f;
+        world[8]=s*sc; world[9]=0.f;  world[10]=c*sc; world[11]=0.f;
+        world[12]=g_remote[i].x; world[13]=g_remote[i].y; world[14]=g_remote[i].z; world[15]=1.f;
+        glUniformMatrix4fv(g_skin_u_world, 1, GL_FALSE, world);
+
+        glBindBuffer(GL_ARRAY_BUFFER, mdl->vbo);
+        if(g_skin_a_pos>=0)    glVertexAttribPointer(g_skin_a_pos,    3,GL_FLOAT,GL_FALSE,64,(void*)0);
+        if(g_skin_a_uv>=0)     glVertexAttribPointer(g_skin_a_uv,     2,GL_FLOAT,GL_FALSE,64,(void*)12);
+        if(g_skin_a_norm>=0)   glVertexAttribPointer(g_skin_a_norm,   3,GL_FLOAT,GL_FALSE,64,(void*)20);
+        if(g_skin_a_joints>=0) glVertexAttribPointer(g_skin_a_joints, 4,GL_FLOAT,GL_FALSE,64,(void*)32);
+        if(g_skin_a_weights>=0)glVertexAttribPointer(g_skin_a_weights,4,GL_FLOAT,GL_FALSE,64,(void*)48);
+
+        for (const auto& am : mdl->meshes) {
+            glBindTexture(GL_TEXTURE_2D, am.tex);
+            glDrawArrays(GL_TRIANGLES, am.start, am.count);
+        }
+    }
+
+    if(g_skin_a_pos>=0)    glDisableVertexAttribArray(g_skin_a_pos);
+    if(g_skin_a_uv>=0)     glDisableVertexAttribArray(g_skin_a_uv);
+    if(g_skin_a_norm>=0)   glDisableVertexAttribArray(g_skin_a_norm);
+    if(g_skin_a_joints>=0) glDisableVertexAttribArray(g_skin_a_joints);
+    if(g_skin_a_weights>=0)glDisableVertexAttribArray(g_skin_a_weights);
+
+    glEnable(GL_CULL_FACE);
+}
+
+static void render() {
+    glViewport(0, 0, g_scene.canvas_w, g_scene.canvas_h);
+    glClearColor(0.35f,0.35f,0.35f,1.f);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+
+    // First-person camera — g_local.y is feet; g_cat_eye_height raises camera to eye level
+    float eye_y = g_local.y + g_cat_eye_height;
+    float tx = g_local.x + cosf(g_local.pitch) * sinf(g_local.yaw);
+    float ty = eye_y + sinf(g_local.pitch);
+    float tz = g_local.z + cosf(g_local.pitch) * cosf(g_local.yaw);
+
+    M4 proj, view, vp;
+    m4_persp(proj, 1.0f, (float)g_scene.canvas_w / g_scene.canvas_h, 0.5f, 1000.f);
+    m4_lookat(view, g_local.x, eye_y, g_local.z, tx, ty, tz);
+    m4_mul(vp, proj, view);
+
+    // Scale quad colors by TV emission + rotate screen normal by cone yaw/pitch
+    float scaled_col[4][3];
+    for (int q=0;q<4;q++) for (int k=0;k<3;k++)
+        scaled_col[q][k] = g_light.quad_col[q][k] * g_light.tv_intensity;
+    float yaw_r   = g_light.cone_yaw   * 3.14159265f / 180.f;
+    float pitch_r = g_light.cone_pitch * 3.14159265f / 180.f;
+    float cy=cosf(yaw_r), sy=sinf(yaw_r);
+    float bn0=g_light.screen_normal[0], bn1=g_light.screen_normal[1], bn2=g_light.screen_normal[2];
+    float n0= cy*bn0 + sy*bn2, n1=bn1, n2=-sy*bn0 + cy*bn2; // yaw
+    float cp=cosf(pitch_r), sp=sinf(pitch_r);
+    float cone_dir[3] = { n0, cp*n1 - sp*n2, sp*n1 + cp*n2 }; // pitch
+
+    render_scene(vp, scaled_col, cone_dir);
+    render_avatars(vp, scaled_col, cone_dir);
+}
 
 // ============================================================
-//  Exported functions
+//  Exported functions (called by JS via ccall)
 // ============================================================
-
-// ── RENDERER_ONLY exports ────────────────────────────────────
-#ifdef RENDERER_ONLY
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_move_key(int key, int pressed) {
     // key: 0=W 1=S 2=A 3=D
@@ -1483,7 +1085,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_move_key(int key, int pressed) {
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void add_mouse_delta(float dx, float dy) {
-    const float sens = 0.0025f;
+    const float sens = MOUSE_SENSITIVITY;
     g_local.yaw   += dx * sens;
     g_local.pitch += dy * sens;
     if (g_local.pitch >  1.48f) g_local.pitch =  1.48f;
@@ -1511,35 +1113,34 @@ extern "C" EMSCRIPTEN_KEEPALIVE void upload_frame(const uint8_t* rgba, int w, in
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_lamp_pos(float x, float y, float z) {
-    g_lamp_pos[0]=x; g_lamp_pos[1]=y; g_lamp_pos[2]=z;
+    g_light.lamp_pos[0]=x; g_light.lamp_pos[1]=y; g_light.lamp_pos[2]=z;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void set_lamp_intensity(float v) {
-    g_lamp_intensity = v;
+    g_light.lamp_intensity = v;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void set_tv_light_intensity(float v) {
-    g_tv_light_intensity = v;
+    g_light.tv_intensity = v;
 }
 // Set all 4 quadrant colours at once — called by JS after receiving each frame from worker
 extern "C" EMSCRIPTEN_KEEPALIVE void set_tv_quad_colors(
     float r0,float g0,float b0, float r1,float g1,float b1,
     float r2,float g2,float b2, float r3,float g3,float b3) {
-    g_tv_quad_col[0][0]=r0; g_tv_quad_col[0][1]=g0; g_tv_quad_col[0][2]=b0;
-    g_tv_quad_col[1][0]=r1; g_tv_quad_col[1][1]=g1; g_tv_quad_col[1][2]=b1;
-    g_tv_quad_col[2][0]=r2; g_tv_quad_col[2][1]=g2; g_tv_quad_col[2][2]=b2;
-    g_tv_quad_col[3][0]=r3; g_tv_quad_col[3][1]=g3; g_tv_quad_col[3][2]=b3;
+    g_light.quad_col[0][0]=r0; g_light.quad_col[0][1]=g0; g_light.quad_col[0][2]=b0;
+    g_light.quad_col[1][0]=r1; g_light.quad_col[1][1]=g1; g_light.quad_col[1][2]=b1;
+    g_light.quad_col[2][0]=r2; g_light.quad_col[2][1]=g2; g_light.quad_col[2][2]=b2;
+    g_light.quad_col[3][0]=r3; g_light.quad_col[3][1]=g3; g_light.quad_col[3][2]=b3;
 }
-extern "C" EMSCRIPTEN_KEEPALIVE void set_js_colors(int v) { g_js_colors = (v != 0); }
-extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_yaw(float v)   { g_cone_yaw   = v; }
-extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_pitch(float v) { g_cone_pitch = v; }
-extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_power(float v) { g_cone_power = v; }
+extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_yaw(float v)   { g_light.cone_yaw   = v; }
+extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_pitch(float v) { g_light.cone_pitch = v; }
+extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_power(float v) { g_light.cone_power = v; }
 extern "C" EMSCRIPTEN_KEEPALIVE void set_overscan(float x, float y) {
-    g_overscan_x = x; g_overscan_y = y;
+    g_scene.overscan_x = x; g_scene.overscan_y = y;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void set_room_xform(float scale, float rot_y_deg,
                                                      float tx, float ty, float tz) {
-    g_room_scale = scale;
-    g_room_rot_y = rot_y_deg * 3.14159265f / 180.f;
-    g_room_tx = tx; g_room_ty = ty; g_room_tz = tz;
+    g_scene.room_scale = scale;
+    g_scene.room_rot_y = rot_y_deg * 3.14159265f / 180.f;
+    g_scene.room_tx = tx; g_scene.room_ty = ty; g_scene.room_tz = tz;
 }
 
 // TV world position (screen prim translation) — for 3D audio panner placement
@@ -1588,78 +1189,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player_model(int id, int model) 
     }
 }
 
-extern "C" EMSCRIPTEN_KEEPALIVE void set_player_model(int /*model*/) {
-    // No-op: model choice is now per remote player via set_remote_player_model
-}
-
-#endif // RENDERER_ONLY
-
-// ── CORE_ONLY exports ────────────────────────────────────────
-#ifdef CORE_ONLY
-
-extern "C" EMSCRIPTEN_KEEPALIVE void set_button(int id, int pressed) {
-    if (id>=0&&id<16) g_buttons[id]=pressed;
-}
-
-extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {
-    FILE* f=fopen(path,"rb");
-    if (!f) { printf("Cannot open %s\n",path); return; }
-    fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
-    std::vector<uint8_t> buf(sz);
-    fread(buf.data(),1,sz,f); fclose(f);
-    retro_game_info info={}; info.path=path; info.data=buf.data(); info.size=(size_t)sz;
-    if (retro_load_game(&info)) {
-        g_running = true;
-        retro_system_av_info av = {};
-        retro_get_system_av_info(&av);
-        if (av.timing.sample_rate > 0)
-            g_audio_sample_rate = (unsigned)av.timing.sample_rate;
-        printf("ROM loaded (%ld bytes), audio %u Hz\n", sz, g_audio_sample_rate);
-
-        // Load save RAM from /saves/<stem>.srm into the core's SRAM buffer
-        void* sram_ptr  = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
-        size_t sram_size = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
-        if (sram_ptr && sram_size > 0) {
-            std::string rp(path);
-            size_t sl = rp.rfind('/');
-            std::string base = (sl != std::string::npos) ? rp.substr(sl+1) : rp;
-            size_t dt = base.rfind('.');
-            std::string stem = (dt != std::string::npos) ? base.substr(0, dt) : base;
-            std::string savePath = std::string("/saves/") + stem + ".srm";
-            FILE* sf = fopen(savePath.c_str(), "rb");
-            if (sf) {
-                fseek(sf, 0, SEEK_END); long ssz = ftell(sf); rewind(sf);
-                if (ssz > 0 && (size_t)ssz <= sram_size)
-                    fread(sram_ptr, 1, ssz, sf);
-                fclose(sf);
-                printf("Save loaded: %s (%ld bytes)\n", savePath.c_str(), ssz);
-            }
-        }
-    } else printf("retro_load_game failed\n");
-}
-
-// Run one emulator frame — called by the worker's setInterval loop
-extern "C" EMSCRIPTEN_KEEPALIVE void step_frame() {
-    if (g_running) retro_run();
-}
-
-extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* get_frame_ptr() {
-    return g_frame_rgba.empty() ? nullptr : g_frame_rgba.data();
-}
-extern "C" EMSCRIPTEN_KEEPALIVE int get_frame_w() { return (int)g_frame_w; }
-extern "C" EMSCRIPTEN_KEEPALIVE int get_frame_h() { return (int)g_frame_h; }
-
-extern "C" EMSCRIPTEN_KEEPALIVE int16_t* get_audio_buf_ptr()    { return g_audio_buf; }
-extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_write_pos()  { return g_audio_write; }
-extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_buf_size()   { return AUDIO_BUF; }
-extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_sample_rate(){ return (int)g_audio_sample_rate; }
-
-#endif // CORE_ONLY
-
 // ============================================================
-//  Main loop + init
+//  Main loop
 // ============================================================
-#ifdef RENDERER_ONLY
 static void loop() {
     update_player();
     render_crt_pass();  // reads g_game_tex (uploaded by JS via receiveFrame/texImage2D)
@@ -1678,19 +1210,3 @@ int main() {
     emscripten_set_main_loop(loop, 60, 1);
     return 0;
 }
-#endif // RENDERER_ONLY
-
-#ifdef CORE_ONLY
-int main() {
-    retro_set_environment      (retro_environment);
-    retro_set_video_refresh    (retro_video_refresh);
-    retro_set_audio_sample     (retro_audio_sample);
-    retro_set_audio_sample_batch(retro_audio_sample_batch);
-    retro_set_input_poll       (retro_input_poll);
-    retro_set_input_state      (retro_input_state);
-    retro_init();
-    // Keep runtime alive so JS can call step_frame(), start_game(), etc. via ccall
-    emscripten_exit_with_live_runtime();
-    return 0;
-}
-#endif // CORE_ONLY

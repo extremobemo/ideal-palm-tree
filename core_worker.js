@@ -22,6 +22,8 @@ var pingBuf = null;
 var pongBuf = null;
 var usesPing = true;
 
+var audioBuf = null;   // pre-allocated Int16Array for audio accumulation; sized once in onReady
+
 // Max PS1 frame = 640×480×4 = 1,228,800 bytes
 var MAX_FRAME_BYTES = 1228800;
 
@@ -75,6 +77,8 @@ function onReady(msg) {
   // Pre-allocate ping-pong frame buffers
   pingBuf = new ArrayBuffer(MAX_FRAME_BYTES);
   pongBuf = new ArrayBuffer(MAX_FRAME_BYTES);
+  // Pre-allocate audio accumulation buffer — reused every tick, avoids per-frame allocation
+  audioBuf = new Int16Array(audioBufSize);
 
   // Run one emulator frame every ~16ms (~60fps)
   frameInterval = setInterval(tickFrame, 16);
@@ -119,12 +123,13 @@ function tickFrame() {
   var avail = (wp - audioReadPos + audioBufSize) % audioBufSize;
 
   if (avail > 0) {
-    var h16     = coreM.HEAP16;
-    var samples = new Int16Array(avail);
+    var h16 = coreM.HEAP16;
     for (var i = 0; i < avail; i++) {
-      samples[i] = h16[audioBase + ((audioReadPos + i) % audioBufSize)];
+      audioBuf[i] = h16[audioBase + ((audioReadPos + i) % audioBufSize)];
     }
     audioReadPos = (audioReadPos + avail) % audioBufSize;
-    self.postMessage({ type: 'audio', samples: samples.buffer }, [samples.buffer]);
+    // Slice into a fresh transferable buffer (audioBuf itself must remain reusable)
+    var out = audioBuf.buffer.slice(0, avail * 2);
+    self.postMessage({ type: 'audio', samples: out }, [out]);
   }
 }
