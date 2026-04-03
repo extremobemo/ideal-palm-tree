@@ -27,6 +27,55 @@
   }
   label:hover { background: #333; }
   #wrap { position: relative; }
+
+  /* ── Settings gear button ── */
+  #settings-btn {
+    position: fixed; top: 14px; right: 14px; z-index: 1000;
+    background: #222; border: 1px solid #444; border-radius: 6px;
+    color: #bbb; font-size: 20px; width: 36px; height: 36px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s, color 0.15s;
+  }
+  #settings-btn:hover { background: #333; color: #ddd; }
+
+  /* ── Settings sidebar ── */
+  #settings-panel {
+    position: fixed; top: 0; right: -320px; width: 300px; height: 100vh;
+    background: #1c1c1c; border-left: 1px solid #2a2a2a;
+    z-index: 999; transition: right 0.25s ease;
+    overflow-y: auto; padding: 56px 16px 24px;
+  }
+  #settings-panel.open { right: 0; }
+  #settings-panel .s-section { margin-bottom: 18px; }
+  #settings-panel .s-title {
+    color: #555; font: 10px monospace; text-transform: uppercase;
+    letter-spacing: 0.1em; margin-bottom: 8px;
+    border-bottom: 1px solid #272727; padding-bottom: 4px;
+  }
+  #settings-panel .s-row {
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 6px; flex-wrap: wrap;
+  }
+  #settings-panel label {
+    background: none; border: none; padding: 0;
+    color: #aaa; font: 11px monospace; cursor: default;
+    display: flex; align-items: center; gap: 5px;
+  }
+  #settings-panel label:hover { background: none; }
+  #settings-panel input[type=range] { width: 90px; vertical-align: middle; }
+  #settings-panel input[type=number] {
+    width: 55px; background: #1a1a1a; border: 1px solid #383838;
+    color: #ddd; padding: 2px 4px; border-radius: 4px; font: 11px monospace;
+  }
+  #settings-panel select {
+    background: #1a1a1a; border: 1px solid #383838; color: #ddd;
+    padding: 2px 4px; border-radius: 4px; font: 11px monospace;
+  }
+  #settings-panel .val { color: #ccc; min-width: 28px; }
+  #settings-panel .core-row { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+  #settings-panel .core-icon { font-size: 13px; width: 20px; flex-shrink: 0; }
+  #settings-panel .core-label { color: #999; font: 11px monospace; }
+  #settings-panel .core-note { color: #555; font: 10px monospace; margin-left: 2px; }
 </style>
 </head>
 <body>
@@ -71,91 +120,107 @@
     <input type="file" id="gba-save-input" accept=".sav,.srm" hidden>
   </label>
   &nbsp; <span id="status">Loading room...</span>
-  &nbsp;&nbsp;
-  <label style="font:11px monospace;color:#aaa">Overscan X
-    <input type="range" id="overscan-x" min="-0.3" max="0.4" step="0.005" value="0.04"
-           style="width:80px;vertical-align:middle">
-  </label>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Y
-    <input type="range" id="overscan-y" min="-0.3" max="0.4" step="0.005" value="0.04"
-           style="width:80px;vertical-align:middle">
-  </label>
 </div>
-<div id="room-bar">
-  <span style="color:#888;font:11px monospace">Room:</span>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Scale
-    <input type="range" id="room-scale" min="1" max="60" step="0.5" value="32" style="width:80px;vertical-align:middle">
-    <span id="room-scale-val" style="color:#ccc">10</span>
-  </label>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Rot Y°
-    <input type="number" id="room-roty" value="-180" step="5" style="width:50px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">X
-    <input type="number" id="room-tx" value="4" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  <label style="font:11px monospace;color:#aaa">Y
-    <input type="number" id="room-ty" value="21" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  <label style="font:11px monospace;color:#aaa">Z
-    <input type="number" id="room-tz" value="15" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-</div>
-<div id="lamp-bar">
-  <span style="color:#888;font:11px monospace">Lamp:</span>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">X
-    <input type="number" id="lamp-x" value="0" step="5" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  <label style="font:11px monospace;color:#aaa">Y
-    <input type="number" id="lamp-y" value="-45" step="5" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  <label style="font:11px monospace;color:#aaa">Z
-    <input type="number" id="lamp-z" value="-260" step="5" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Intensity
-    <input type="range" id="lamp-intensity" min="0" max="12" step="0.1" value="1" style="width:80px;vertical-align:middle">
-    <span id="lamp-intensity-val" style="color:#ccc">1</span>
-  </label>
-  &nbsp;&nbsp;
-  <span style="color:#888;font:11px monospace">TV:</span>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Emission
-    <input type="range" id="tv-intensity" min="0" max="8" step="0.1" value="1.7" style="width:80px;vertical-align:middle">
-    <span id="tv-intensity-val" style="color:#ccc">1.7</span>
-  </label>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Cone Yaw°
-    <input type="number" id="cone-yaw" value="0" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  <label style="font:11px monospace;color:#aaa">Pitch°
-    <input type="number" id="cone-pitch" value="-362" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  <label style="font:11px monospace;color:#aaa">Power
-    <input type="number" id="cone-power" value="18.2" step="0.1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-</div>
-<div id="player-bar">
-  <span style="color:#888;font:11px monospace">Me:</span>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Feet Y
-    <input type="number" id="my-y" value="20" step="1" style="width:60px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Eye height
-    <input type="number" id="cat-eye-height" value="-35" step="1" style="width:60px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-  </label>
-  &nbsp;
-  <label style="font:11px monospace;color:#aaa">Avatar
-    <select id="player-model" style="background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
-      <option value="0">Cat</option>
-      <option value="1">Incidental 70</option>
-    </select>
-  </label>
+<!-- ── Settings gear button ── -->
+<button id="settings-btn" onclick="document.getElementById('settings-panel').classList.toggle('open')" title="Settings">&#9881;</button>
+
+<!-- ── Settings sidebar ── -->
+<div id="settings-panel">
+  <div class="s-section">
+    <div class="s-title">Cores</div>
+    <div class="core-row">
+      <span id="core-icon-gbc" class="core-icon">⏳</span>
+      <span class="core-label">Game Boy / GBC</span>
+    </div>
+    <div class="core-row">
+      <span id="core-icon-gba" class="core-icon">⏳</span>
+      <span class="core-label">Game Boy Advance</span>
+    </div>
+    <div class="core-row">
+      <span id="core-icon-snes" class="core-icon">⏳</span>
+      <span class="core-label">SNES</span>
+    </div>
+    <div class="core-row">
+      <span id="core-icon-ps1" class="core-icon">⏳</span>
+      <span class="core-label">PS1</span>
+      <span id="core-note-ps1" class="core-note"></span>
+    </div>
+    <div class="core-row">
+      <span id="core-icon-n64" class="core-icon">⏳</span>
+      <span class="core-label">N64</span>
+    </div>
+  </div>
+  <div class="s-section">
+    <div class="s-title">Overscan</div>
+    <div class="s-row">
+      <label>X <input type="range" id="overscan-x" min="-0.3" max="0.4" step="0.005" value="0.04"></label>
+    </div>
+    <div class="s-row">
+      <label>Y <input type="range" id="overscan-y" min="-0.3" max="0.4" step="0.005" value="0.04"></label>
+    </div>
+  </div>
+  <div class="s-section">
+    <div class="s-title">Room</div>
+    <div class="s-row">
+      <label>Scale
+        <input type="range" id="room-scale" min="1" max="60" step="0.5" value="32">
+        <span id="room-scale-val" class="val">10</span>
+      </label>
+    </div>
+    <div class="s-row">
+      <label>Rot Y° <input type="number" id="room-roty" value="-180" step="5"></label>
+    </div>
+    <div class="s-row">
+      <label>X <input type="number" id="room-tx" value="4" step="1"></label>
+      <label>Y <input type="number" id="room-ty" value="21" step="1"></label>
+      <label>Z <input type="number" id="room-tz" value="15" step="1"></label>
+    </div>
+  </div>
+  <div class="s-section">
+    <div class="s-title">Lamp</div>
+    <div class="s-row">
+      <label>X <input type="number" id="lamp-x" value="0" step="5"></label>
+      <label>Y <input type="number" id="lamp-y" value="-45" step="5"></label>
+      <label>Z <input type="number" id="lamp-z" value="-260" step="5"></label>
+    </div>
+    <div class="s-row">
+      <label>Intensity
+        <input type="range" id="lamp-intensity" min="0" max="12" step="0.1" value="1">
+        <span id="lamp-intensity-val" class="val">1</span>
+      </label>
+    </div>
+  </div>
+  <div class="s-section">
+    <div class="s-title">TV</div>
+    <div class="s-row">
+      <label>Emission
+        <input type="range" id="tv-intensity" min="0" max="8" step="0.1" value="1.7">
+        <span id="tv-intensity-val" class="val">1.7</span>
+      </label>
+    </div>
+    <div class="s-row">
+      <label>Cone Yaw° <input type="number" id="cone-yaw" value="0" step="1"></label>
+    </div>
+    <div class="s-row">
+      <label>Pitch° <input type="number" id="cone-pitch" value="-362" step="1"></label>
+      <label>Power <input type="number" id="cone-power" value="18.2" step="0.1"></label>
+    </div>
+  </div>
+  <div class="s-section">
+    <div class="s-title">Player</div>
+    <div class="s-row">
+      <label>Feet Y <input type="number" id="my-y" value="20" step="1"></label>
+      <label>Eye height <input type="number" id="cat-eye-height" value="-35" step="1"></label>
+    </div>
+    <div class="s-row">
+      <label>Avatar
+        <select id="player-model">
+          <option value="0">Cat</option>
+          <option value="1">Incidental 70</option>
+        </select>
+      </label>
+    </div>
+  </div>
 </div>
 <div id="mp-bar">
   <button onclick="mpHost()">Host</button>
@@ -857,6 +922,47 @@ document.getElementById('player-model').addEventListener('change', function() {
   localModel = parseInt(this.value);
 });
 
+// ── Core readiness checks ─────────────────────────────────────
+let _ps1CoreAvailable = false;
+
+function setCoreIcon(id, ok, note) {
+  const icon = document.getElementById('core-icon-' + id);
+  if (icon) icon.textContent = ok ? '✅' : '❌';
+  if (note !== undefined) {
+    const noteEl = document.getElementById('core-note-' + id);
+    if (noteEl) noteEl.textContent = note;
+  }
+}
+
+function checkCores() {
+  const coreFiles = { gbc: 'core_gbc.js', gba: 'core_gba.js', snes: 'core_snes.js' };
+  Object.entries(coreFiles).forEach(function([id, file]) {
+    fetch(file, { method: 'HEAD' })
+      .then(function(r) { setCoreIcon(id, r.ok); })
+      .catch(function()  { setCoreIcon(id, false); });
+  });
+
+  // PS1: core file + BIOS required
+  fetch('core_ps1.js', { method: 'HEAD' })
+    .then(function(r) {
+      _ps1CoreAvailable = r.ok;
+      if (!r.ok) { setCoreIcon('ps1', false, '(file missing)'); return; }
+      setCoreIcon('ps1', false, '(needs BIOS)');
+    })
+    .catch(function() { _ps1CoreAvailable = false; setCoreIcon('ps1', false, '(file missing)'); });
+
+  // N64: needs both n64wasm.js and assets.zip
+  Promise.all([
+    fetch('n64wasm.js',  { method: 'HEAD' }).then(r => r.ok).catch(() => false),
+    fetch('assets.zip',  { method: 'HEAD' }).then(r => r.ok).catch(() => false)
+  ]).then(function([wasm, assets]) {
+    if (wasm && assets) { setCoreIcon('n64', true); }
+    else { setCoreIcon('n64', false, wasm ? '(missing assets.zip)' : '(file missing)'); }
+  });
+}
+
+checkCores();
+
 // ── PS1 BIOS loading ──────────────────────────────────────────
 document.getElementById('bios-input').addEventListener('change', function(e) {
   const file = e.target.files[0];
@@ -866,6 +972,7 @@ document.getElementById('bios-input').addEventListener('change', function(e) {
     window._ps1BiosName  = file.name;
     window._ps1BiosBytes = new Uint8Array(ev.target.result);
     ps1BiosLoaded = true;
+    if (_ps1CoreAvailable) setCoreIcon('ps1', true, '');
     setStatus('BIOS ready: ' + file.name + ' — now load a PS1 disc');
   };
   reader.readAsArrayBuffer(file);
