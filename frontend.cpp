@@ -152,7 +152,8 @@ struct RemotePlayer {
     bool  active = false;
     bool  moving = false;
     float anim_time = 0.f;
-    int   anim_idx  = 1; // idle
+    int   anim_idx  = 0;
+    int   model_idx = 0; // 0=cat, 1=incidental_70
 };
 static RemotePlayer g_remote[8];
 // ── Cat skinned model ────────────────────────────────────────────────────────
@@ -165,26 +166,32 @@ struct CatAnim {
     std::vector<CatChannel> channels;
 };
 static const int CAT_JOINTS = 29;
-static const int CAT_NODES  = 40; // slightly larger than 38 for safety
+static const int CAT_NODES  = 64; // large enough for all supported models
+struct AvatarMesh { int start, count; GLuint tex; };
+struct AvatarModel {
+    GLuint vbo = 0;
+    std::vector<AvatarMesh> meshes;
+    int joint_count = 0;
+    int joint_nodes[CAT_JOINTS] = {};
+    float inv_bind[CAT_JOINTS][16] = {};
+    int node_count = 0;
+    int node_parent[CAT_NODES] = {};
+    float node_def_t[CAT_NODES][3] = {};
+    float node_def_r[CAT_NODES][4] = {};
+    float node_def_s[CAT_NODES][3] = {};
+    std::vector<CatAnim> anims;
+    int idle_anim = 0;
+    int walk_anim = 0;
+    bool loaded = false;
+};
+static AvatarModel g_models[2]; // 0=cat, 1=incidental_70
 static GLuint g_skin_prog  = 0;
-static GLuint g_cat_vbo    = 0;
-static GLuint g_cat_tex    = 0;
-static int    g_cat_vcount = 0;
-static int    g_cat_joint_nodes[CAT_JOINTS];
-static float  g_cat_inv_bind [CAT_JOINTS][16];
-static float  g_cat_bone_mats[CAT_JOINTS][16];
-static int    g_cat_node_parent  [CAT_NODES];
-static float  g_cat_node_def_t   [CAT_NODES][3];
-static float  g_cat_node_def_r   [CAT_NODES][4];
-static float  g_cat_node_def_s   [CAT_NODES][3];
-static float  g_cat_node_t       [CAT_NODES][3];
-static float  g_cat_node_r       [CAT_NODES][4];
-static float  g_cat_node_s       [CAT_NODES][3];
-static float  g_cat_node_global  [CAT_NODES][16];
-static std::vector<CatAnim> g_cat_anims;
-static int    g_cat_anim_idx = 1; // idle
-static float  g_cat_anim_time = 0.f;
-static int    g_cat_node_count = 0;
+// Shared scratch buffers for animation evaluation (overwritten each frame per player)
+static float  g_cat_bone_mats [CAT_JOINTS][16];
+static float  g_cat_node_t    [CAT_NODES][3];
+static float  g_cat_node_r    [CAT_NODES][4];
+static float  g_cat_node_s    [CAT_NODES][3];
+static float  g_cat_node_global[CAT_NODES][16];
 static int    g_skin_u_vp=-1, g_skin_u_world=-1, g_skin_u_bones=-1;
 static int    g_skin_u_tex=-1, g_skin_u_tv_quad_pos=-1, g_skin_u_tv_quad_col=-1, g_skin_u_tv_normal=-1;
 static int    g_skin_u_lamp_pos=-1, g_skin_u_lamp_intensity=-1;
@@ -895,79 +902,109 @@ static void load_room() {
     cgltf_free(gltf);
 }
 
-static void load_cat() {
+static void load_avatar(AvatarModel* dest, const char* gltf_path) {
+    // ── Free previous data ────────────────────────────────────────────────────
+    if (dest->vbo) { glDeleteBuffers(1, &dest->vbo); dest->vbo = 0; }
+    for (auto& m : dest->meshes) if (m.tex) glDeleteTextures(1, &m.tex);
+    dest->meshes.clear();
+    dest->anims.clear();
+    dest->loaded = false;
+
     cgltf_options opts = {};
     cgltf_data* gltf = nullptr;
-    cgltf_result r = cgltf_parse_file(&opts, "/tv/cat/scene.gltf", &gltf);
-    if (r != cgltf_result_success) { printf("cat: cgltf_parse_file failed %d\n", r); return; }
-    r = cgltf_load_buffers(&opts, gltf, "/tv/cat/scene.gltf");
-    if (r != cgltf_result_success) { printf("cat: cgltf_load_buffers failed %d\n", r); cgltf_free(gltf); return; }
+    cgltf_result r = cgltf_parse_file(&opts, gltf_path, &gltf);
+    if (r != cgltf_result_success) { printf("avatar: cgltf_parse_file failed %d\n", r); return; }
+    r = cgltf_load_buffers(&opts, gltf, gltf_path);
+    if (r != cgltf_result_success) { printf("avatar: cgltf_load_buffers failed %d\n", r); cgltf_free(gltf); return; }
 
-    g_cat_node_count = (int)gltf->nodes_count;
+    dest->node_count = (int)gltf->nodes_count;
 
     // ── Node hierarchy + default TRS ─────────────────────────────────────────
-    for (int ni = 0; ni < g_cat_node_count; ni++) g_cat_node_parent[ni] = -1;
-    for (int ni = 0; ni < g_cat_node_count; ni++) {
+    for (int ni = 0; ni < dest->node_count; ni++) dest->node_parent[ni] = -1;
+    for (int ni = 0; ni < dest->node_count; ni++) {
         cgltf_node* n = &gltf->nodes[ni];
         for (cgltf_size ci = 0; ci < n->children_count; ci++)
-            g_cat_node_parent[(int)(n->children[ci]-gltf->nodes)] = ni;
+            dest->node_parent[(int)(n->children[ci]-gltf->nodes)] = ni;
     }
-    for (int ni = 0; ni < g_cat_node_count; ni++) {
+    for (int ni = 0; ni < dest->node_count; ni++) {
         cgltf_node* n = &gltf->nodes[ni];
-        if (n->has_translation) memcpy(g_cat_node_def_t[ni], n->translation, 12);
-        else { g_cat_node_def_t[ni][0]=0; g_cat_node_def_t[ni][1]=0; g_cat_node_def_t[ni][2]=0; }
-        if (n->has_rotation) memcpy(g_cat_node_def_r[ni], n->rotation, 16);
-        else { g_cat_node_def_r[ni][0]=0; g_cat_node_def_r[ni][1]=0; g_cat_node_def_r[ni][2]=0; g_cat_node_def_r[ni][3]=1; }
-        if (n->has_scale) memcpy(g_cat_node_def_s[ni], n->scale, 12);
-        else { g_cat_node_def_s[ni][0]=1; g_cat_node_def_s[ni][1]=1; g_cat_node_def_s[ni][2]=1; }
+        if (n->has_translation) memcpy(dest->node_def_t[ni], n->translation, 12);
+        else { dest->node_def_t[ni][0]=0; dest->node_def_t[ni][1]=0; dest->node_def_t[ni][2]=0; }
+        if (n->has_rotation) memcpy(dest->node_def_r[ni], n->rotation, 16);
+        else { dest->node_def_r[ni][0]=0; dest->node_def_r[ni][1]=0; dest->node_def_r[ni][2]=0; dest->node_def_r[ni][3]=1; }
+        if (n->has_scale) memcpy(dest->node_def_s[ni], n->scale, 12);
+        else { dest->node_def_s[ni][0]=1; dest->node_def_s[ni][1]=1; dest->node_def_s[ni][2]=1; }
     }
 
     // ── Skin ─────────────────────────────────────────────────────────────────
     cgltf_skin* skin = &gltf->skins[0];
-    for (int j = 0; j < CAT_JOINTS; j++)
-        g_cat_joint_nodes[j] = (int)(skin->joints[j] - gltf->nodes);
+    dest->joint_count = (int)skin->joints_count;
+    if (dest->joint_count > CAT_JOINTS) dest->joint_count = CAT_JOINTS;
+    for (int j = 0; j < dest->joint_count; j++)
+        dest->joint_nodes[j] = (int)(skin->joints[j] - gltf->nodes);
     if (skin->inverse_bind_matrices) {
-        for (int j = 0; j < CAT_JOINTS; j++)
-            cgltf_accessor_read_float(skin->inverse_bind_matrices, j, g_cat_inv_bind[j], 16);
+        for (int j = 0; j < dest->joint_count; j++)
+            cgltf_accessor_read_float(skin->inverse_bind_matrices, j, dest->inv_bind[j], 16);
     } else {
-        for (int j = 0; j < CAT_JOINTS; j++) { m4_identity(g_cat_inv_bind[j]); }
+        for (int j = 0; j < dest->joint_count; j++) { m4_identity(dest->inv_bind[j]); }
     }
 
-    // ── Mesh VBO (expand indices → flat list) ────────────────────────────────
-    cgltf_primitive* prim = &gltf->meshes[0].primitives[0];
-    cgltf_accessor *pos_acc=nullptr,*uv_acc=nullptr,*norm_acc=nullptr,*joints_acc=nullptr,*weights_acc=nullptr;
-    for (cgltf_size ai = 0; ai < prim->attributes_count; ai++) {
-        cgltf_attribute& at = prim->attributes[ai];
-        if (at.type==cgltf_attribute_type_position)                         pos_acc=at.data;
-        if (at.type==cgltf_attribute_type_texcoord && at.index==0)          uv_acc=at.data;
-        if (at.type==cgltf_attribute_type_normal)                           norm_acc=at.data;
-        if (at.type==cgltf_attribute_type_joints  && at.index==0)          joints_acc=at.data;
-        if (at.type==cgltf_attribute_type_weights && at.index==0)          weights_acc=at.data;
+    // ── Mesh VBO (all meshes concatenated) + per-mesh textures ───────────────
+    char base_dir[256] = {};
+    const char* last_slash = strrchr(gltf_path, '/');
+    if (last_slash) {
+        int len = (int)(last_slash - gltf_path) + 1;
+        if (len < 256) { memcpy(base_dir, gltf_path, len); }
     }
-    int icount = (int)prim->indices->count;
-    std::vector<float> vdata(icount * 16);
-    for (int ii = 0; ii < icount; ii++) {
-        unsigned idx = 0; cgltf_accessor_read_uint(prim->indices, ii, &idx, 1);
-        float* dst = &vdata[ii*16];
-        if (pos_acc)     cgltf_accessor_read_float(pos_acc,    idx, dst+0,  3); else {dst[0]=dst[1]=dst[2]=0;}
-        if (uv_acc)      cgltf_accessor_read_float(uv_acc,     idx, dst+3,  2); else {dst[3]=dst[4]=0;}
-        if (norm_acc)    cgltf_accessor_read_float(norm_acc,   idx, dst+5,  3); else {dst[5]=0;dst[6]=1;dst[7]=0;}
-        if (joints_acc)  { unsigned ji[4]={0,0,0,0}; cgltf_accessor_read_uint(joints_acc, idx, ji, 4);
-                           dst[8]=(float)ji[0];dst[9]=(float)ji[1];dst[10]=(float)ji[2];dst[11]=(float)ji[3]; }
-        if (weights_acc) cgltf_accessor_read_float(weights_acc, idx, dst+12, 4);
+
+    std::vector<float> vdata;
+    for (cgltf_size mi = 0; mi < gltf->meshes_count; mi++) {
+        cgltf_primitive* prim = &gltf->meshes[mi].primitives[0];
+        cgltf_accessor *pos_acc=nullptr,*uv_acc=nullptr,*norm_acc=nullptr,*joints_acc=nullptr,*weights_acc=nullptr;
+        for (cgltf_size ai = 0; ai < prim->attributes_count; ai++) {
+            cgltf_attribute& at = prim->attributes[ai];
+            if (at.type==cgltf_attribute_type_position)                        pos_acc=at.data;
+            if (at.type==cgltf_attribute_type_texcoord && at.index==0)         uv_acc=at.data;
+            if (at.type==cgltf_attribute_type_normal)                          norm_acc=at.data;
+            if (at.type==cgltf_attribute_type_joints  && at.index==0)         joints_acc=at.data;
+            if (at.type==cgltf_attribute_type_weights && at.index==0)         weights_acc=at.data;
+        }
+        int icount = (int)prim->indices->count;
+        int vstart = (int)(vdata.size() / 16);
+        vdata.resize(vdata.size() + icount * 16);
+        for (int ii = 0; ii < icount; ii++) {
+            unsigned idx = 0; cgltf_accessor_read_uint(prim->indices, ii, &idx, 1);
+            float* dst = &vdata[(vstart + ii)*16];
+            if (pos_acc)     cgltf_accessor_read_float(pos_acc,    idx, dst+0,  3); else {dst[0]=dst[1]=dst[2]=0;}
+            if (uv_acc)      cgltf_accessor_read_float(uv_acc,     idx, dst+3,  2); else {dst[3]=dst[4]=0;}
+            if (norm_acc)    cgltf_accessor_read_float(norm_acc,   idx, dst+5,  3); else {dst[5]=0;dst[6]=1;dst[7]=0;}
+            if (joints_acc)  { unsigned ji[4]={0,0,0,0}; cgltf_accessor_read_uint(joints_acc, idx, ji, 4);
+                               dst[8]=(float)ji[0];dst[9]=(float)ji[1];dst[10]=(float)ji[2];dst[11]=(float)ji[3]; }
+            if (weights_acc) cgltf_accessor_read_float(weights_acc, idx, dst+12, 4);
+        }
+        GLuint tex = 0;
+        if (prim->material) {
+            cgltf_texture* ct = prim->material->pbr_metallic_roughness.base_color_texture.texture;
+            if (ct && ct->image && ct->image->uri) {
+                char tex_path[512];
+                snprintf(tex_path, sizeof(tex_path), "%s%s", base_dir, ct->image->uri);
+                tex = load_tex(tex_path);
+            }
+        }
+        AvatarMesh am; am.start = vstart; am.count = icount; am.tex = tex;
+        dest->meshes.push_back(am);
     }
-    g_cat_vcount = icount;
-    glGenBuffers(1, &g_cat_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, g_cat_vbo);
+    glGenBuffers(1, &dest->vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, dest->vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vdata.size()*4), vdata.data(), GL_STATIC_DRAW);
 
-    // ── Texture ───────────────────────────────────────────────────────────────
-    g_cat_tex = load_tex("/tv/cat/textures/heheBanana_baseColor.png");
-    if (!g_cat_tex) { printf("cat: texture not found\n"); }
-
     // ── Animations ───────────────────────────────────────────────────────────
+    dest->idle_anim = 0; dest->walk_anim = 0;
     for (cgltf_size ai = 0; ai < gltf->animations_count; ai++) {
         cgltf_animation* ca = &gltf->animations[ai];
+        const char* name = ca->name ? ca->name : "";
+        if (strstr(name, "idle")) dest->idle_anim = (int)ai;
+        if (strstr(name, "walk")) dest->walk_anim = (int)ai;
         CatAnim anim; anim.duration = 0.f;
         for (cgltf_size si = 0; si < ca->samplers_count; si++) {
             float last = 0.f;
@@ -993,37 +1030,44 @@ static void load_cat() {
             for (cgltf_size k=0;k<out->count;k++) cgltf_accessor_read_float(out,k,&chan.values[k*comp],comp);
             anim.channels.push_back(std::move(chan));
         }
-        g_cat_anims.push_back(std::move(anim));
+        dest->anims.push_back(std::move(anim));
     }
-    printf("cat: %d joints, %d verts, %zu anims\n", CAT_JOINTS, g_cat_vcount, g_cat_anims.size());
+    printf("avatar: %d joints, %zu meshes, %zu anims, idle=%d walk=%d\n",
+           dest->joint_count, dest->meshes.size(), dest->anims.size(), dest->idle_anim, dest->walk_anim);
 
-    // ── Shader ────────────────────────────────────────────────────────────────
-    GLuint vs=make_shader(GL_VERTEX_SHADER,SKIN_VS);
-    GLuint fs=make_shader(GL_FRAGMENT_SHADER,SKIN_FS);
-    g_skin_prog=glCreateProgram();
-    glAttachShader(g_skin_prog,vs); glAttachShader(g_skin_prog,fs);
-    glLinkProgram(g_skin_prog);
-    { GLint ok; glGetProgramiv(g_skin_prog,GL_LINK_STATUS,&ok);
-      if(!ok){char buf[512];glGetProgramInfoLog(g_skin_prog,512,nullptr,buf);printf("skin link error: %s\n",buf);} }
-    glDeleteShader(vs); glDeleteShader(fs);
-    g_skin_u_vp    =glGetUniformLocation(g_skin_prog,"u_vp");
-    g_skin_u_world =glGetUniformLocation(g_skin_prog,"u_world");
-    g_skin_u_bones =glGetUniformLocation(g_skin_prog,"u_bones");
-    g_skin_u_tex        =glGetUniformLocation(g_skin_prog,"u_tex");
-    g_skin_u_tv_quad_pos=glGetUniformLocation(g_skin_prog,"u_tv_quad_pos");
-    g_skin_u_tv_quad_col=glGetUniformLocation(g_skin_prog,"u_tv_quad_col");
-    g_skin_u_tv_normal  =glGetUniformLocation(g_skin_prog,"u_tv_normal");
-    g_skin_u_cone_power =glGetUniformLocation(g_skin_prog,"u_cone_power");
-    g_skin_u_lamp_pos=glGetUniformLocation(g_skin_prog,"u_lamp_pos");
-    g_skin_u_lamp_intensity=glGetUniformLocation(g_skin_prog,"u_lamp_intensity");
-    g_skin_a_pos    =glGetAttribLocation(g_skin_prog,"a_pos");
-    g_skin_a_uv     =glGetAttribLocation(g_skin_prog,"a_uv");
-    g_skin_a_norm   =glGetAttribLocation(g_skin_prog,"a_norm");
-    g_skin_a_joints =glGetAttribLocation(g_skin_prog,"a_joints");
-    g_skin_a_weights=glGetAttribLocation(g_skin_prog,"a_weights");
+    // ── Shader (compile only once) ────────────────────────────────────────────
+    if (!g_skin_prog) {
+        GLuint vs=make_shader(GL_VERTEX_SHADER,SKIN_VS);
+        GLuint fs=make_shader(GL_FRAGMENT_SHADER,SKIN_FS);
+        g_skin_prog=glCreateProgram();
+        glAttachShader(g_skin_prog,vs); glAttachShader(g_skin_prog,fs);
+        glLinkProgram(g_skin_prog);
+        { GLint ok; glGetProgramiv(g_skin_prog,GL_LINK_STATUS,&ok);
+          if(!ok){char buf[512];glGetProgramInfoLog(g_skin_prog,512,nullptr,buf);printf("skin link error: %s\n",buf);} }
+        glDeleteShader(vs); glDeleteShader(fs);
+        g_skin_u_vp    =glGetUniformLocation(g_skin_prog,"u_vp");
+        g_skin_u_world =glGetUniformLocation(g_skin_prog,"u_world");
+        g_skin_u_bones =glGetUniformLocation(g_skin_prog,"u_bones");
+        g_skin_u_tex        =glGetUniformLocation(g_skin_prog,"u_tex");
+        g_skin_u_tv_quad_pos=glGetUniformLocation(g_skin_prog,"u_tv_quad_pos");
+        g_skin_u_tv_quad_col=glGetUniformLocation(g_skin_prog,"u_tv_quad_col");
+        g_skin_u_tv_normal  =glGetUniformLocation(g_skin_prog,"u_tv_normal");
+        g_skin_u_cone_power =glGetUniformLocation(g_skin_prog,"u_cone_power");
+        g_skin_u_lamp_pos=glGetUniformLocation(g_skin_prog,"u_lamp_pos");
+        g_skin_u_lamp_intensity=glGetUniformLocation(g_skin_prog,"u_lamp_intensity");
+        g_skin_a_pos    =glGetAttribLocation(g_skin_prog,"a_pos");
+        g_skin_a_uv     =glGetAttribLocation(g_skin_prog,"a_uv");
+        g_skin_a_norm   =glGetAttribLocation(g_skin_prog,"a_norm");
+        g_skin_a_joints =glGetAttribLocation(g_skin_prog,"a_joints");
+        g_skin_a_weights=glGetAttribLocation(g_skin_prog,"a_weights");
+    }
 
     cgltf_free(gltf);
+    dest->loaded = true;
 }
+
+static void load_cat()        { load_avatar(&g_models[0], "/tv/cat/scene.gltf"); }
+static void load_incidental() { load_avatar(&g_models[1], "/tv/incidental_70/scene.gltf"); }
 
 // ============================================================
 //  GL init
@@ -1191,25 +1235,26 @@ static void gl_init() {
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
     }
     load_cat();
+    load_incidental();
 }
 
 // ============================================================
 //  Render
 // ============================================================
-static void update_cat_anim(int anim_idx, float anim_time) {
-    if (g_cat_anims.empty() || anim_idx < 0 || anim_idx >= (int)g_cat_anims.size()) return;
-    CatAnim& anim = g_cat_anims[anim_idx];
+static void update_anim(AvatarModel* mdl, int anim_idx, float anim_time) {
+    if (mdl->anims.empty() || anim_idx < 0 || anim_idx >= (int)mdl->anims.size()) return;
+    CatAnim& anim = mdl->anims[anim_idx];
 
     // Reset to default pose
-    for (int ni=0;ni<g_cat_node_count;ni++){
-        memcpy(g_cat_node_t[ni],g_cat_node_def_t[ni],12);
-        memcpy(g_cat_node_r[ni],g_cat_node_def_r[ni],16);
-        memcpy(g_cat_node_s[ni],g_cat_node_def_s[ni],12);
+    for (int ni=0;ni<mdl->node_count;ni++){
+        memcpy(g_cat_node_t[ni],mdl->node_def_t[ni],12);
+        memcpy(g_cat_node_r[ni],mdl->node_def_r[ni],16);
+        memcpy(g_cat_node_s[ni],mdl->node_def_s[ni],12);
     }
 
     // Sample channels
     for (const CatChannel& ch : anim.channels) {
-        int n=ch.node; if(n<0||n>=g_cat_node_count) continue;
+        int n=ch.node; if(n<0||n>=mdl->node_count) continue;
         int kc=(int)ch.times.size(); if(kc==0) continue;
         int lo=kc-1;
         for(int k=0;k<kc;k++){ if(ch.times[k]>anim_time){lo=k-1;break;} }
@@ -1233,14 +1278,14 @@ static void update_cat_anim(int anim_idx, float anim_time) {
         }
     }
 
-    // Compute global transforms (nodes are parent-before-child in glTF)
+    // Compute global transforms
     bool done[CAT_NODES]={};
-    int left=g_cat_node_count;
+    int left=mdl->node_count;
     while(left>0){
         int prev=left;
-        for(int ni=0;ni<g_cat_node_count;ni++){
+        for(int ni=0;ni<mdl->node_count;ni++){
             if(done[ni]) continue;
-            int p=g_cat_node_parent[ni];
+            int p=mdl->node_parent[ni];
             if(p>=0&&!done[p]) continue;
             M4 local; m4_from_trs(local,g_cat_node_t[ni],g_cat_node_r[ni],g_cat_node_s[ni]);
             if(p<0) memcpy(g_cat_node_global[ni],local,64);
@@ -1251,8 +1296,8 @@ static void update_cat_anim(int anim_idx, float anim_time) {
     }
 
     // Compute bone matrices = global[joint] * inv_bind[j]
-    for(int j=0;j<CAT_JOINTS;j++){
-        M4 bone; m4_mul(bone, g_cat_node_global[g_cat_joint_nodes[j]], g_cat_inv_bind[j]);
+    for(int j=0;j<mdl->joint_count;j++){
+        M4 bone; m4_mul(bone, g_cat_node_global[mdl->joint_nodes[j]], mdl->inv_bind[j]);
         memcpy(g_cat_bone_mats[j],bone,64);
     }
 }
@@ -1351,12 +1396,11 @@ static void render() {
         if (p.double_sided) glEnable(GL_CULL_FACE);
     }
 
-    // ── Remote player cat models ─────────────────────────────────────────────
-    if (g_skin_prog && g_cat_vbo && g_cat_tex) {
+    // ── Remote player avatar models ──────────────────────────────────────────
+    if (g_skin_prog) {
         glUseProgram(g_skin_prog);
         glUniform1i(g_skin_u_tex, 0);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g_cat_tex);
         glUniform3fv(g_skin_u_tv_quad_pos, 4, &g_tv_quad_pos[0][0]);
         glUniform3fv(g_skin_u_tv_quad_col, 4, &scaled_col[0][0]);
         glUniform3fv(g_skin_u_tv_normal,   1, cone_dir);
@@ -1366,30 +1410,31 @@ static void render() {
 
         glDisable(GL_CULL_FACE);
 
-        glBindBuffer(GL_ARRAY_BUFFER, g_cat_vbo);
-        if(g_skin_a_pos>=0)    {glEnableVertexAttribArray(g_skin_a_pos);    glVertexAttribPointer(g_skin_a_pos,    3,GL_FLOAT,GL_FALSE,64,(void*)0);}
-        if(g_skin_a_uv>=0)     {glEnableVertexAttribArray(g_skin_a_uv);     glVertexAttribPointer(g_skin_a_uv,     2,GL_FLOAT,GL_FALSE,64,(void*)12);}
-        if(g_skin_a_norm>=0)   {glEnableVertexAttribArray(g_skin_a_norm);   glVertexAttribPointer(g_skin_a_norm,   3,GL_FLOAT,GL_FALSE,64,(void*)20);}
-        if(g_skin_a_joints>=0) {glEnableVertexAttribArray(g_skin_a_joints); glVertexAttribPointer(g_skin_a_joints, 4,GL_FLOAT,GL_FALSE,64,(void*)32);}
-        if(g_skin_a_weights>=0){glEnableVertexAttribArray(g_skin_a_weights);glVertexAttribPointer(g_skin_a_weights,4,GL_FLOAT,GL_FALSE,64,(void*)48);}
+        if(g_skin_a_pos>=0)    glEnableVertexAttribArray(g_skin_a_pos);
+        if(g_skin_a_uv>=0)     glEnableVertexAttribArray(g_skin_a_uv);
+        if(g_skin_a_norm>=0)   glEnableVertexAttribArray(g_skin_a_norm);
+        if(g_skin_a_joints>=0) glEnableVertexAttribArray(g_skin_a_joints);
+        if(g_skin_a_weights>=0)glEnableVertexAttribArray(g_skin_a_weights);
 
         for (int i=0; i<8; i++) {
             if (!g_remote[i].active) continue;
+            AvatarModel* mdl = &g_models[g_remote[i].model_idx];
+            if (!mdl->loaded || !mdl->vbo || mdl->meshes.empty()) continue;
 
-            // Advance per-player animation, switching between idle (1) and walk (2)
-            int target = g_remote[i].moving ? 2 : 1;
+            // Advance animation, switching between idle and walk
+            int target = g_remote[i].moving ? mdl->walk_anim : mdl->idle_anim;
             if (g_remote[i].anim_idx != target) {
                 g_remote[i].anim_idx  = target;
                 g_remote[i].anim_time = 0.f;
             }
-            if (!g_cat_anims.empty() && g_remote[i].anim_idx < (int)g_cat_anims.size()) {
-                float dur = g_cat_anims[g_remote[i].anim_idx].duration;
+            if (g_remote[i].anim_idx < (int)mdl->anims.size()) {
+                float dur = mdl->anims[g_remote[i].anim_idx].duration;
                 if (dur > 0.f) g_remote[i].anim_time = fmodf(g_remote[i].anim_time + 1.f/60.f, dur);
             }
-            update_cat_anim(g_remote[i].anim_idx, g_remote[i].anim_time);
+            update_anim(mdl, g_remote[i].anim_idx, g_remote[i].anim_time);
 
             glUniformMatrix4fv(g_skin_u_vp,    1, GL_FALSE, vp);
-            glUniformMatrix4fv(g_skin_u_bones, CAT_JOINTS, GL_FALSE, &g_cat_bone_mats[0][0]);
+            glUniformMatrix4fv(g_skin_u_bones, mdl->joint_count, GL_FALSE, &g_cat_bone_mats[0][0]);
 
             float c=cosf(g_remote[i].yaw), s=sinf(g_remote[i].yaw);
             float sc=0.2f;
@@ -1399,7 +1444,18 @@ static void render() {
             world[8]=s*sc; world[9]=0.f;  world[10]=c*sc; world[11]=0.f;
             world[12]=g_remote[i].x; world[13]=g_remote[i].y; world[14]=g_remote[i].z; world[15]=1.f;
             glUniformMatrix4fv(g_skin_u_world, 1, GL_FALSE, world);
-            glDrawArrays(GL_TRIANGLES, 0, g_cat_vcount);
+
+            glBindBuffer(GL_ARRAY_BUFFER, mdl->vbo);
+            if(g_skin_a_pos>=0)    glVertexAttribPointer(g_skin_a_pos,    3,GL_FLOAT,GL_FALSE,64,(void*)0);
+            if(g_skin_a_uv>=0)     glVertexAttribPointer(g_skin_a_uv,     2,GL_FLOAT,GL_FALSE,64,(void*)12);
+            if(g_skin_a_norm>=0)   glVertexAttribPointer(g_skin_a_norm,   3,GL_FLOAT,GL_FALSE,64,(void*)20);
+            if(g_skin_a_joints>=0) glVertexAttribPointer(g_skin_a_joints, 4,GL_FLOAT,GL_FALSE,64,(void*)32);
+            if(g_skin_a_weights>=0)glVertexAttribPointer(g_skin_a_weights,4,GL_FLOAT,GL_FALSE,64,(void*)48);
+
+            for (const auto& am : mdl->meshes) {
+                glBindTexture(GL_TEXTURE_2D, am.tex);
+                glDrawArrays(GL_TRIANGLES, am.start, am.count);
+            }
         }
 
         if(g_skin_a_pos>=0)    glDisableVertexAttribArray(g_skin_a_pos);
@@ -1520,6 +1576,20 @@ extern "C" EMSCRIPTEN_KEEPALIVE int get_local_moving() {
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void remove_remote_player(int id) {
     if (id >= 0 && id < 8) g_remote[id].active = false;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player_model(int id, int model) {
+    if (id < 0 || id >= 8) return;
+    int mdl = (model == 1) ? 1 : 0;
+    if (g_remote[id].model_idx != mdl) {
+        g_remote[id].model_idx = mdl;
+        g_remote[id].anim_idx  = g_models[mdl].idle_anim;
+        g_remote[id].anim_time = 0.f;
+    }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_player_model(int /*model*/) {
+    // No-op: model choice is now per remote player via set_remote_player_model
 }
 
 #endif // RENDERER_ONLY

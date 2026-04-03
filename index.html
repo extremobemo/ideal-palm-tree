@@ -149,6 +149,13 @@
   <label style="font:11px monospace;color:#aaa">Eye height
     <input type="number" id="cat-eye-height" value="-35" step="1" style="width:60px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
   </label>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Avatar
+    <select id="player-model" style="background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+      <option value="0">Cat</option>
+      <option value="1">Incidental 70</option>
+    </select>
+  </label>
 </div>
 <div id="mp-bar">
   <button onclick="mpHost()">Host</button>
@@ -431,6 +438,8 @@ function setupVideoReceive(stream) {
   })();
 }
 
+let localModel = 0; // 0=cat, 1=incidental_70
+
 function startPositionSync(conn) {
   setInterval(function() {
     if (!conn.open || !rendererModule) return;
@@ -439,7 +448,8 @@ function startPositionSync(conn) {
       y:      rendererModule.ccall('get_local_y',      'number', [], []),
       z:      rendererModule.ccall('get_local_z',      'number', [], []),
       yaw:    rendererModule.ccall('get_local_yaw',    'number', [], []),
-      moving: rendererModule.ccall('get_local_moving', 'number', [], [])
+      moving: rendererModule.ccall('get_local_moving', 'number', [], []),
+      model:  localModel
     });
   }, 50); // 20 Hz
 }
@@ -460,10 +470,13 @@ function mpHost() {
       startPositionSync(conn);
     });
     conn.on('data', function(data) {
-      if (data.type === 'pos' && rendererModule)
+      if (data.type === 'pos' && rendererModule) {
         rendererModule.ccall('set_remote_player', 'void',
           ['number','number','number','number','number','number'],
           [remoteId, data.x, data.y, data.z, data.yaw, data.moving || 0]);
+        rendererModule.ccall('set_remote_player_model', 'void',
+          ['number','number'], [remoteId, data.model || 0]);
+      }
     });
     conn.on('close', function() {
       if (rendererModule) rendererModule.ccall('remove_remote_player','void',['number'],[remoteId]);
@@ -492,10 +505,13 @@ function mpJoin() {
       startPositionSync(conn);
     });
     conn.on('data', function(data) {
-      if (data.type === 'pos' && rendererModule)
+      if (data.type === 'pos' && rendererModule) {
         rendererModule.ccall('set_remote_player', 'void',
           ['number','number','number','number','number','number'],
           [0, data.x, data.y, data.z, data.yaw, data.moving || 0]);
+        rendererModule.ccall('set_remote_player_model', 'void',
+          ['number','number'], [0, data.model || 0]);
+      }
     });
     conn.on('close', function() {
       if (rendererModule) rendererModule.ccall('remove_remote_player','void',['number'],[0]);
@@ -835,6 +851,10 @@ document.getElementById('my-y').addEventListener('input', function() {
 document.getElementById('cat-eye-height').addEventListener('input', function() {
   if (!coreModule) return;
   coreModule.ccall('set_cat_eye_height', null, ['number'], [parseFloat(this.value)]);
+});
+
+document.getElementById('player-model').addEventListener('change', function() {
+  localModel = parseInt(this.value);
 });
 
 // ── PS1 BIOS loading ──────────────────────────────────────────

@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-RENDERER_EXPORTS='["_main","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size","_upload_frame","_get_local_x","_get_local_y","_get_local_z","_get_local_yaw","_get_local_pitch","_set_remote_player","_remove_remote_player","_get_tv_x","_get_tv_y","_get_tv_z","_set_overscan","_set_room_xform","_set_lamp_pos","_set_lamp_intensity","_set_tv_light_intensity","_set_tv_quad_colors","_set_js_colors","_set_cone_yaw","_set_cone_pitch","_set_cone_power","_get_local_moving","_set_cat_eye_height","_set_local_y"]'
+RENDERER_EXPORTS='["_main","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size","_upload_frame","_get_local_x","_get_local_y","_get_local_z","_get_local_yaw","_get_local_pitch","_set_remote_player","_remove_remote_player","_get_tv_x","_get_tv_y","_get_tv_z","_set_overscan","_set_room_xform","_set_lamp_pos","_set_lamp_intensity","_set_tv_light_intensity","_set_tv_quad_colors","_set_js_colors","_set_cone_yaw","_set_cone_pitch","_set_cone_power","_get_local_moving","_set_cat_eye_height","_set_local_y","_set_player_model","_set_remote_player_model"]'
 
 CORE_EXPORTS='["_main","_start_game","_set_button","_step_frame","_get_frame_ptr","_get_frame_w","_get_frame_h","_get_audio_buf_ptr","_get_audio_write_pos","_get_audio_buf_size","_get_audio_sample_rate"]'
 
