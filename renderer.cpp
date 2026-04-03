@@ -180,6 +180,8 @@ struct RemotePlayer {
     float anim_time = 0.f;
     int   anim_idx  = 0;
     int   model_idx = 0; // 0=cat, 1=incidental_70
+    GLuint name_tex = 0;
+    int    name_w = 0, name_h = 0;
 };
 static RemotePlayer g_remote[8];
 
@@ -237,6 +239,14 @@ static int    g_flat_a_pos  = -1, g_flat_u_mvp = -1, g_flat_u_color = -1;
 static GLuint g_cube_vbo    = 0;
 static float  g_debug_pos[3] = {};
 static bool   g_debug_visible = false;
+
+// ── Billboard nameplate ───────────────────────────────────────────────────────
+static GLuint g_bill_prog       = 0;
+static int    g_bill_a_corner   = -1;
+static int    g_bill_u_center   = -1, g_bill_u_cam_right = -1, g_bill_u_cam_up = -1;
+static int    g_bill_u_hw       = -1, g_bill_u_hh = -1, g_bill_u_vp = -1;
+static GLuint g_bill_vbo        = 0;
+static uint8_t g_name_upload_buf[256 * 64 * 4];  // shared upload scratch buffer
 
 // Frame dimensions — set by set_frame_size() and used by CRT shader uniforms
 static unsigned g_frame_w = 160, g_frame_h = 144;
@@ -815,6 +825,27 @@ static void gl_init() {
         glBindBuffer(GL_ARRAY_BUFFER, g_cube_vbo);
         glBufferData(GL_ARRAY_BUFFER, sizeof(cv), cv, GL_STATIC_DRAW);
     }
+    // Billboard shader + quad VBO
+    {
+        GLuint vs = make_shader(GL_VERTEX_SHADER,   VS_BILL);
+        GLuint fs = make_shader(GL_FRAGMENT_SHADER, FS_BILL);
+        g_bill_prog = glCreateProgram();
+        glAttachShader(g_bill_prog, vs); glAttachShader(g_bill_prog, fs);
+        glLinkProgram(g_bill_prog);
+        glDeleteShader(vs); glDeleteShader(fs);
+        g_bill_a_corner    = glGetAttribLocation (g_bill_prog, "a_corner");
+        g_bill_u_center    = glGetUniformLocation(g_bill_prog, "u_center");
+        g_bill_u_cam_right = glGetUniformLocation(g_bill_prog, "u_cam_right");
+        g_bill_u_cam_up    = glGetUniformLocation(g_bill_prog, "u_cam_up");
+        g_bill_u_hw        = glGetUniformLocation(g_bill_prog, "u_hw");
+        g_bill_u_hh        = glGetUniformLocation(g_bill_prog, "u_hh");
+        g_bill_u_vp        = glGetUniformLocation(g_bill_prog, "u_vp");
+        // Quad: 4 corners as triangle strip — (-1,-1),(1,-1),(-1,1),(1,1)
+        static const float bq[] = { -1.f,-1.f,  1.f,-1.f,  -1.f,1.f,  1.f,1.f };
+        glGenBuffers(1, &g_bill_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, g_bill_vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(bq), bq, GL_STATIC_DRAW);
+    }
 
     load_tv();
     for (const auto& p : g_prims)
@@ -1004,7 +1035,7 @@ static void render_scene(const M4 vp, const float scaled_col[4][3], const float 
 }
 
 // ── Skinned remote player avatars ────────────────────────────────────────────
-static void render_avatars(const M4 vp, const float scaled_col[4][3], const float cone_dir[3]) {
+static void render_avatars(const M4 vp, const M4 view, const float scaled_col[4][3], const float cone_dir[3]) {
     if (!g_skin_prog) return;
 
     glUseProgram(g_skin_prog);
@@ -1074,6 +1105,43 @@ static void render_avatars(const M4 vp, const float scaled_col[4][3], const floa
     if(g_skin_a_joints>=0) glDisableVertexAttribArray(g_skin_a_joints);
     if(g_skin_a_weights>=0)glDisableVertexAttribArray(g_skin_a_weights);
 
+    // Render nameplates as camera-facing billboards above each active player
+    if (g_bill_prog) {
+        // Camera right/up extracted from view matrix rows (column-major: row i = m[i], m[4+i], m[8+i])
+        float cam_right[3] = { view[0], view[4], view[8]  };
+        float cam_up[3]    = { view[1], view[5], view[9]  };
+
+        glUseProgram(g_bill_prog);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        glUniformMatrix4fv(g_bill_u_vp,        1, GL_FALSE, vp);
+        glUniform3fv      (g_bill_u_cam_right,  1, cam_right);
+        glUniform3fv      (g_bill_u_cam_up,     1, cam_up);
+
+        glBindBuffer(GL_ARRAY_BUFFER, g_bill_vbo);
+        glEnableVertexAttribArray(g_bill_a_corner);
+        glVertexAttribPointer(g_bill_a_corner, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+        for (int i = 0; i < 8; i++) {
+            if (!g_remote[i].active || !g_remote[i].name_tex) continue;
+            float hw = 15.f;
+            float hh = (g_remote[i].name_h > 0)
+                     ? hw * (float)g_remote[i].name_h / (float)g_remote[i].name_w
+                     : hw * 0.25f;
+            glUniform3f(g_bill_u_center, g_remote[i].x, g_remote[i].y - 50.f, g_remote[i].z);
+            glUniform1f(g_bill_u_hw, hw);
+            glUniform1f(g_bill_u_hh, hh);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_remote[i].name_tex);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+
+        glDisableVertexAttribArray(g_bill_a_corner);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+
     glEnable(GL_CULL_FACE);
 }
 
@@ -1106,7 +1174,7 @@ static void render() {
     float cone_dir[3] = { n0, cp*n1 - sp*n2, sp*n1 + cp*n2 }; // pitch
 
     render_scene(vp, scaled_col, cone_dir);
-    render_avatars(vp, scaled_col, cone_dir);
+    render_avatars(vp, view, scaled_col, cone_dir);
 
     // Debug cube — audio source visualiser
     if (g_debug_visible && g_flat_prog && g_cube_vbo) {
@@ -1248,6 +1316,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player_model(int id, int model) 
         g_remote[id].anim_idx  = g_models[mdl].idle_anim;
         g_remote[id].anim_time = 0.f;
     }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* get_name_upload_buf() {
+    return g_name_upload_buf;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player_name_tex(int id, int w, int h) {
+    if (id < 0 || id >= 8) return;
+    if (!g_remote[id].name_tex) glGenTextures(1, &g_remote[id].name_tex);
+    glBindTexture(GL_TEXTURE_2D, g_remote[id].name_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_name_upload_buf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_remote[id].name_w = w;
+    g_remote[id].name_h = h;
 }
 
 // ============================================================

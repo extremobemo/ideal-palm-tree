@@ -363,3 +363,35 @@ precision mediump float;
 uniform vec3 u_color;
 void main() { gl_FragColor = vec4(u_color, 1.0); }
 )";
+
+// ============================================================
+//  Billboard shader — textured quad always facing the camera
+// ============================================================
+static const char* VS_BILL = R"(
+attribute vec2 a_corner;
+uniform vec3  u_center;
+uniform vec3  u_cam_right;
+uniform vec3  u_cam_up;
+uniform float u_hw;
+uniform float u_hh;
+uniform mat4  u_vp;
+varying vec2  v_uv;
+void main() {
+    vec3 world = u_center
+               + u_cam_right * a_corner.x * u_hw
+               + u_cam_up    * a_corner.y * u_hh;
+    gl_Position = u_vp * vec4(world, 1.0);
+    v_uv = vec2(a_corner.x * 0.5 + 0.5, 0.5 - a_corner.y * 0.5);
+}
+)";
+
+static const char* FS_BILL = R"(
+precision mediump float;
+varying vec2 v_uv;
+uniform sampler2D u_tex;
+void main() {
+    vec4 c = texture2D(u_tex, v_uv);
+    if (c.a < 0.05) discard;
+    gl_FragColor = c;
+}
+)";

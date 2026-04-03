@@ -13,6 +13,7 @@ export const state = {
   controller:    'host', // 'host' or a conn index — who currently controls the game
   isController:  false,  // guest-side: true when this guest has been given control
   localModel:     0,     // avatar model index (0=cat, 1=incidental_70), sent in position packets
+  localName:      '',    // display name shown above this player's head to others
 };
 
 // Off-screen canvas used to capture game frames for WebRTC streaming.

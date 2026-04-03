@@ -147,6 +147,10 @@ document.getElementById('player-model').addEventListener('change', function() {
   state.localModel = parseInt(this.value);
 });
 
+document.getElementById('local-name').addEventListener('input', function() {
+  state.localName = this.value.trim().slice(0, 20);
+});
+
 // ── Core readiness checks ─────────────────────────────────────
 let _ps1CoreAvailable = false;
 

@@ -41,6 +41,8 @@ export function initInput() {
   });
 
   document.addEventListener('keydown', e => {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (MOVE_MAP[e.code] !== undefined && state.rendererModule) {
       e.preventDefault();
       state.rendererModule.ccall('set_move_key', 'void',
@@ -61,6 +63,8 @@ export function initInput() {
   });
 
   document.addEventListener('keyup', e => {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (MOVE_MAP[e.code] !== undefined && state.rendererModule)
       state.rendererModule.ccall('set_move_key', 'void',
         ['number','number'], [MOVE_MAP[e.code], 0]);

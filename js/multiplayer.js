@@ -11,6 +11,29 @@ let peerInst  = null;
 let mpConns   = [];
 let gameStream = null;
 let hostConn  = null;   // guest-side: connection back to the host
+let remoteNames = new Array(8).fill('');  // last-seen name per remote slot
+
+// Generate a nameplate RGBA texture and upload it to C++ for the given remote slot
+function uploadNameplate(slotId, name) {
+  if (!state.rendererModule || !name) return;
+  const W = 256, H = 64;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(6, 6, W - 12, H - 12);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 28px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(name, W / 2, H / 2, W - 24);
+  const imgData = ctx.getImageData(0, 0, W, H);
+  const M = state.rendererModule;
+  const ptr = M.ccall('get_name_upload_buf', 'number', [], []);
+  M.HEAPU8.set(imgData.data, ptr);
+  M.ccall('set_remote_player_name_tex', null, ['number','number','number'], [slotId, W, H]);
+}
 
 // Send a button event to the host (called by input.js when this guest has control)
 export function mpSendButton(id, pressed) {
@@ -129,6 +152,7 @@ function startPositionSync(conn) {
       yaw:    state.rendererModule.ccall('get_local_yaw',    'number', [], []),
       moving: state.rendererModule.ccall('get_local_moving', 'number', [], []),
       model:  state.localModel,
+      name:   state.localName,
     });
   }, 16);
 }
@@ -233,6 +257,10 @@ export function mpHost() {
           [remoteId, data.x, data.y, data.z, data.yaw, data.moving || 0]);
         state.rendererModule.ccall('set_remote_player_model', 'void',
           ['number','number'], [remoteId, data.model || 0]);
+        if (data.name !== remoteNames[remoteId]) {
+          remoteNames[remoteId] = data.name || '';
+          uploadNameplate(remoteId, remoteNames[remoteId]);
+        }
       } else if (data.type === 'scene') {
         applySceneState(data);
       } else if (data.type === 'btn' && state.controller === remoteId && state.coreWorker) {
@@ -242,6 +270,7 @@ export function mpHost() {
     conn.on('close', function() {
       // If this guest had control, reset to host
       if (state.controller === remoteId) ctrlSetHost();
+      remoteNames[remoteId] = '';
       if (state.rendererModule)
         state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [remoteId]);
       // Remove their option from the controller select
@@ -288,6 +317,10 @@ export function mpJoin() {
           [0, data.x, data.y, data.z, data.yaw, data.moving || 0]);
         state.rendererModule.ccall('set_remote_player_model', 'void',
           ['number','number'], [0, data.model || 0]);
+        if (data.name !== remoteNames[0]) {
+          remoteNames[0] = data.name || '';
+          uploadNameplate(0, remoteNames[0]);
+        }
       } else if (data.type === 'scene') {
         applySceneState(data);
       } else if (data.type === 'ctrl') {
@@ -297,6 +330,7 @@ export function mpJoin() {
     hostConn.on('close', function() {
       state.mpConnected = false;
       state.isController = false;
+      remoteNames[0] = '';
       document.querySelector('.scene-section').style.display = '';
       if (state.rendererModule)
         state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [0]);
