@@ -261,6 +261,14 @@ export function mpHost() {
           remoteNames[remoteId] = data.name || '';
           uploadNameplate(remoteId, remoteNames[remoteId]);
         }
+        // Relay this guest's position to all other guests (slot = remoteId + 1
+        // since slot 0 is reserved for the host from each guest's perspective)
+        const relay = { type: 'relay_pos', slot: remoteId + 1,
+          x: data.x, y: data.y, z: data.z, yaw: data.yaw,
+          moving: data.moving || 0, model: data.model || 0, name: data.name || '' };
+        mpConns.forEach(function(otherConn, i) {
+          if (i !== remoteId && otherConn.open) otherConn.send(relay);
+        });
       } else if (data.type === 'scene') {
         applySceneState(data);
       } else if (data.type === 'btn' && state.controller === remoteId && state.coreWorker) {
@@ -268,6 +276,11 @@ export function mpHost() {
       }
     });
     conn.on('close', function() {
+      // Tell other guests to remove this player from their scene
+      mpConns.forEach(function(otherConn, i) {
+        if (i !== remoteId && otherConn.open)
+          otherConn.send({ type: 'remove_player', slot: remoteId + 1 });
+      });
       // If this guest had control, reset to host
       if (state.controller === remoteId) ctrlSetHost();
       remoteNames[remoteId] = '';
@@ -321,6 +334,20 @@ export function mpJoin() {
           remoteNames[0] = data.name || '';
           uploadNameplate(0, remoteNames[0]);
         }
+      } else if (data.type === 'relay_pos' && state.rendererModule) {
+        state.rendererModule.ccall('set_remote_player', 'void',
+          ['number','number','number','number','number','number'],
+          [data.slot, data.x, data.y, data.z, data.yaw, data.moving || 0]);
+        state.rendererModule.ccall('set_remote_player_model', 'void',
+          ['number','number'], [data.slot, data.model || 0]);
+        if (data.name !== remoteNames[data.slot]) {
+          remoteNames[data.slot] = data.name || '';
+          uploadNameplate(data.slot, remoteNames[data.slot]);
+        }
+      } else if (data.type === 'remove_player') {
+        remoteNames[data.slot] = '';
+        if (state.rendererModule)
+          state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [data.slot]);
       } else if (data.type === 'scene') {
         applySceneState(data);
       } else if (data.type === 'ctrl') {

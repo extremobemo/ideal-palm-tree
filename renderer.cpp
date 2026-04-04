@@ -213,7 +213,7 @@ struct AvatarModel {
     int walk_anim = 0;
     bool loaded = false;
 };
-static AvatarModel g_models[2]; // 0=cat, 1=incidental_70
+static AvatarModel g_models[3]; // 0=cat, 1=incidental_70, 2=mech
 static GLuint g_skin_prog  = 0;
 
 // Scratch buffers for animation evaluation — overwritten each frame per active player
@@ -594,10 +594,14 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
         GLuint tex = 0;
         if (prim->material) {
             cgltf_texture* ct = prim->material->pbr_metallic_roughness.base_color_texture.texture;
-            if (ct && ct->image && ct->image->uri) {
-                char tex_path[512];
-                snprintf(tex_path, sizeof(tex_path), "%s%s", base_dir, ct->image->uri);
-                tex = load_tex(tex_path);
+            if (ct && ct->image) {
+                if (ct->image->uri) {
+                    char tex_path[512];
+                    snprintf(tex_path, sizeof(tex_path), "%s%s", base_dir, ct->image->uri);
+                    tex = load_tex(tex_path);
+                } else if (ct->image->buffer_view) {
+                    tex = load_tex_bv(ct->image->buffer_view);
+                }
             }
         }
         AvatarMesh am; am.start = vstart; am.count = icount; am.tex = tex;
@@ -612,8 +616,17 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
     for (cgltf_size ai = 0; ai < gltf->animations_count; ai++) {
         cgltf_animation* ca = &gltf->animations[ai];
         const char* name = ca->name ? ca->name : "";
-        if (strstr(name, "idle")) dest->idle_anim = (int)ai;
-        if (strstr(name, "walk")) dest->walk_anim = (int)ai;
+        // Case-insensitive match so "Idle"/"Walk" (mech) and "idle"/"walk" (cat) both work
+        auto icontains = [](const char* h, const char* n) {
+            for (; *h; h++) {
+                const char *p=h, *q=n;
+                for (; *q && tolower((unsigned char)*p)==tolower((unsigned char)*q); p++,q++);
+                if (!*q) return true;
+            }
+            return false;
+        };
+        if (icontains(name, "idle")) dest->idle_anim = (int)ai;
+        if (icontains(name, "walk")) dest->walk_anim = (int)ai;
         CatAnim anim; anim.duration = 0.f;
         for (cgltf_size si = 0; si < ca->samplers_count; si++) {
             float last = 0.f;
@@ -677,6 +690,7 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
 
 static void load_cat()        { load_avatar(&g_models[0], "/tv/cat/scene.gltf"); }
 static void load_incidental() { load_avatar(&g_models[1], "/tv/incidental_70/scene.gltf"); }
+static void load_mech()       { load_avatar(&g_models[2], "/tv/Mech.glb"); }
 
 // ============================================================
 //  GL init
@@ -892,6 +906,7 @@ static void gl_init() {
     }
     load_cat();
     load_incidental();
+    load_mech();
     // Cache canvas pixel dimensions — the JS side locks canvas size after init,
     // so this is called once here rather than inside every render() frame.
     emscripten_get_canvas_element_size("#canvas", &g_scene.canvas_w, &g_scene.canvas_h);
@@ -1078,7 +1093,8 @@ static void render_avatars(const M4 vp, const M4 view, const float scaled_col[4]
             glUniformMatrix4fv(g_skin_u_bones, mdl->joint_count, GL_FALSE, &g_anim.bone_mats[0][0]);
 
         float c=cosf(g_remote[i].yaw), s=sinf(g_remote[i].yaw);
-        float sc = AVATAR_SCALE * (g_remote[i].model_idx == 1 ? 1.75f : 1.0f);
+        float sc = AVATAR_SCALE * (g_remote[i].model_idx == 1 ? 1.75f :
+                                   g_remote[i].model_idx == 2 ? 60.0f : 1.0f);
         M4 world;
         world[0]=c*sc; world[1]=0.f;  world[2]=-s*sc; world[3]=0.f;
         world[4]=0.f;  world[5]=-sc;  world[6]=0.f;   world[7]=0.f;
@@ -1310,7 +1326,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void remove_remote_player(int id) {
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player_model(int id, int model) {
     if (id < 0 || id >= 8) return;
-    int mdl = (model == 1) ? 1 : 0;
+    int mdl = (model >= 0 && model < 3) ? model : 0;
     if (g_remote[id].model_idx != mdl) {
         g_remote[id].model_idx = mdl;
         g_remote[id].anim_idx  = g_models[mdl].idle_anim;

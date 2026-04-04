@@ -12,7 +12,7 @@ export const state = {
   mpConnected:    false, // true when this client is connected as a guest
   controller:    'host', // 'host' or a conn index — who currently controls the game
   isController:  false,  // guest-side: true when this guest has been given control
-  localModel:     0,     // avatar model index (0=cat, 1=incidental_70), sent in position packets
+  localModel:     0,     // avatar model index (0=cat, 1=incidental_70, 2=mech), sent in position packets
   localName:      '',    // display name shown above this player's head to others
 };
 
