@@ -166,6 +166,8 @@ function startPositionSync(conn) {
 // The actual blit happens inside receiveFrame() (libretro) or the N64 copyLoop.
 function startFrameCapture() {
   gameStream = shareCanvas.captureStream(60);
+  const vTrack = gameStream.getVideoTracks()[0];
+  if (vTrack) vTrack.contentHint = 'motion';
 }
 
 // Rewrite SDP to prefer H.264 Baseline (profile-level-id 42e*/4200*).
@@ -194,7 +196,7 @@ function applyLowLatencyEncoding(pc) {
     if (!sender.track || sender.track.kind !== 'video') return;
     const p = sender.getParameters();
     if (!p.encodings || !p.encodings.length) p.encodings = [{}];
-    p.encodings[0].maxBitrate      = 2_500_000;
+    p.encodings[0].maxBitrate      = 4_000_000;
     p.encodings[0].maxFramerate    = 60;
     p.encodings[0].priority        = 'high';
     p.encodings[0].networkPriority = 'high';
@@ -202,31 +204,49 @@ function applyLowLatencyEncoding(pc) {
   });
 }
 
-// Blit a received video stream into the TV texture (guest-side WebRTC receive)
+// Blit a received video stream into the TV texture (guest-side WebRTC receive).
+// Uses requestVideoFrameCallback when available so we only upload to the GPU
+// when a new decoded frame actually arrives, instead of every rAF tick.
 function setupVideoReceive(stream) {
   const videoEl = document.createElement('video');
   videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true;
+  videoEl.disableRemotePlayback = true;
   videoEl.srcObject = stream;
   videoEl.play().catch(e => console.warn('mp video:', e));
 
   const texId = state.rendererModule.ccall('get_game_tex_id', 'number', [], []);
-  state.rendererModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
+  let frameSizeSet = false;
 
-  (function blitLoop() {
-    if (videoEl.readyState >= 2 && state.frontendGL && state.frontendCtx) {
-      const tex = state.frontendGL.textures[texId];
-      if (tex) {
-        state.frontendCtx.bindTexture(state.frontendCtx.TEXTURE_2D, tex);
-        state.frontendCtx.texImage2D(state.frontendCtx.TEXTURE_2D, 0,
-          state.frontendCtx.RGBA, state.frontendCtx.RGBA,
-          state.frontendCtx.UNSIGNED_BYTE, videoEl);
-        state.frontendCtx.texParameteri(state.frontendCtx.TEXTURE_2D,
-          state.frontendCtx.TEXTURE_MIN_FILTER, state.frontendCtx.LINEAR);
-        jsUpdateQuadColors(videoEl);
-      }
+  function blitFrame() {
+    if (videoEl.readyState < 2 || !state.frontendGL || !state.frontendCtx) return;
+    if (!frameSizeSet && videoEl.videoWidth && videoEl.videoHeight) {
+      state.rendererModule.ccall('set_frame_size', 'void', ['number','number'],
+        [videoEl.videoWidth, videoEl.videoHeight]);
+      frameSizeSet = true;
     }
-    requestAnimationFrame(blitLoop);
-  })();
+    const tex = state.frontendGL.textures[texId];
+    if (tex) {
+      state.frontendCtx.bindTexture(state.frontendCtx.TEXTURE_2D, tex);
+      state.frontendCtx.texImage2D(state.frontendCtx.TEXTURE_2D, 0,
+        state.frontendCtx.RGBA, state.frontendCtx.RGBA,
+        state.frontendCtx.UNSIGNED_BYTE, videoEl);
+      state.frontendCtx.texParameteri(state.frontendCtx.TEXTURE_2D,
+        state.frontendCtx.TEXTURE_MIN_FILTER, state.frontendCtx.LINEAR);
+      jsUpdateQuadColors(videoEl);
+    }
+  }
+
+  if (typeof videoEl.requestVideoFrameCallback === 'function') {
+    (function rvfcLoop() {
+      blitFrame();
+      videoEl.requestVideoFrameCallback(rvfcLoop);
+    })();
+  } else {
+    (function blitLoop() {
+      blitFrame();
+      requestAnimationFrame(blitLoop);
+    })();
+  }
 }
 
 export function mpHost() {
