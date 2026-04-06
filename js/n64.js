@@ -19,6 +19,7 @@
 import { state, shareCtx } from './state.js';
 import { jsUpdateQuadColors } from './worker-bridge.js';
 import { setStatus } from './utils.js';
+import { initN64VirtualPads } from './virtual-gamepad.js';
 
 // Wrap n64wasm.js in an IIFE before injecting.
 // n64wasm.js (Emscripten 2.0.7) uses var/function declarations that conflict with
@@ -100,6 +101,9 @@ export function loadN64(file) {
           fs.writeFile('custom.v64', romBytes);
 
           try { new AudioContext().resume(); } catch(e) {}
+          // Pre-register virtual pads 0 (neutral P1 dummy) and 1 (guest P2)
+          // before callMain so SDL_Init sees them during joystick scan.
+          initN64VirtualPads();
           state.n64Module.callMain(['custom.v64']);
           state.n64Running = true;
           state.nowPlaying = file.name;

@@ -1,6 +1,13 @@
 // Virtual gamepad layer for N64 multi-player.
 // Monkey-patches navigator.getGamepads() so Emscripten/SDL sees guest button
-// inputs as physical gamepads at indices 1-N without any changes to n64.js.
+// inputs as physical gamepads without any changes to n64.js.
+//
+// SDL scans for joysticks during SDL_Init (inside callMain).  Virtual pads must
+// exist BEFORE callMain so SDL opens their slots and polls them each frame.
+// Call initN64VirtualPads() just before state.n64Module.callMain() to pre-register
+// a neutral dummy at slot 0 (player 1 gamepad — keyboard still takes precedence)
+// and an empty guest pad at slot 1 (player 2).  setVirtualButton() then updates
+// slot 1 as guest button events arrive.
 
 const _virtualPads = [];
 
@@ -16,12 +23,17 @@ function makeVirtualPad(index) {
   };
 }
 
+// Call this BEFORE n64Module.callMain() so SDL sees the pads during SDL_Init.
+export function initN64VirtualPads() {
+  for (let i = 0; i <= 1; i++) {
+    while (_virtualPads.length <= i) _virtualPads.push(null);
+    if (!_virtualPads[i]) _virtualPads[i] = makeVirtualPad(i);
+  }
+}
+
 export function setVirtualButton(padIndex, buttonIndex, pressed) {
   while (_virtualPads.length <= padIndex) _virtualPads.push(null);
-  if (!_virtualPads[padIndex]) {
-    _virtualPads[padIndex] = makeVirtualPad(padIndex);
-    window.dispatchEvent(new GamepadEvent('gamepadconnected', { gamepad: _virtualPads[padIndex] }));
-  }
+  if (!_virtualPads[padIndex]) _virtualPads[padIndex] = makeVirtualPad(padIndex);
   const btn = _virtualPads[padIndex].buttons[buttonIndex];
   if (!btn) return;
   btn.pressed = pressed;
