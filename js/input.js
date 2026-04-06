@@ -3,7 +3,7 @@
 // D-pad / face / shoulder buttons → libretro core (port 0 for host, relayed for guests)
 
 import { state } from './state.js';
-import { mpSendButton } from './multiplayer.js';
+import { mpSendButton, mpSendAxis } from './multiplayer.js';
 
 const MOVE_MAP = { 'KeyW': 0, 'KeyS': 1, 'KeyA': 2, 'KeyD': 3 };
 
@@ -43,7 +43,7 @@ const PAD_BUTTON_MAP = [
   [15, 7],  // D-right    → RETRO RIGHT
 ];
 
-const _padPrev = {};   // { [gamepadIndex]: { buttons: bool[] } }
+const _padPrev = {};   // { [gamepadIndex]: { buttons: bool[], axes: number[] } }
 
 // Send a game button press to the core.
 // Host always owns port 0; guests send to the host which assigns their port.
@@ -65,7 +65,7 @@ function pollGamepads() {
     if (!gp) continue;
 
     if (!_padPrev[gi])
-      _padPrev[gi] = { buttons: new Array(gp.buttons.length).fill(false) };
+      _padPrev[gi] = { buttons: new Array(gp.buttons.length).fill(false), axes: [0, 0] };
     const prev = _padPrev[gi];
 
     // ── Game buttons (face, dpad, shoulder) ──────────────────────────────────
@@ -75,6 +75,17 @@ function pollGamepads() {
       if (pressed !== prev.buttons[btnIdx]) {
         prev.buttons[btnIdx] = pressed;
         sendGameButton(retroId, pressed);
+      }
+    }
+
+    // ── Left stick axes — relay to host when guest has a physical gamepad ─────
+    if (state.mpConnected) {
+      for (let ai = 0; ai < 2; ai++) {
+        const val = gp.axes[ai] || 0;
+        if (Math.abs(val - prev.axes[ai]) > 0.02) {
+          prev.axes[ai] = val;
+          mpSendAxis(ai, val);
+        }
       }
     }
 

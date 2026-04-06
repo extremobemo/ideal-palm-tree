@@ -6,7 +6,7 @@ import { state, shareCanvas, shareCtx } from './state.js';
 import { jsUpdateQuadColors } from './worker-bridge.js';
 import { setStatus } from './utils.js';
 import { getGameAudioTrack, startViewerAudio, setAudioSourcePos, setAudioPannerSettings } from './audio.js';
-import { setVirtualButton } from './virtual-gamepad.js';
+import { setVirtualButton, setVirtualAxis } from './virtual-gamepad.js';
 
 // Reverse of PAD_BUTTON_MAP in input.js: libretro button ID → standard gamepad button index
 const RETRO_TO_PAD = {};
@@ -45,6 +45,12 @@ function uploadNameplate(slotId, name) {
 export function mpSendButton(id, pressed) {
   if (hostConn && hostConn.open)
     hostConn.send({ type: 'btn', id, pressed });
+}
+
+// Send an analog axis value to the host (left stick X/Y from a physical gamepad)
+export function mpSendAxis(index, value) {
+  if (hostConn && hostConn.open)
+    hostConn.send({ type: 'axis', index, value });
 }
 
 // ── Scene state ──────────────────────────────────────────────
@@ -277,8 +283,18 @@ export function mpHost() {
         if (state.coreWorker) {
           state.coreWorker.postMessage({ type: 'button', port: remoteId + 1, id: data.id, pressed: data.pressed });
         } else if (state.n64Running) {
-          setVirtualButton(remoteId + 1, RETRO_TO_PAD[data.id], data.pressed);
+          // For N64: retro UP/DOWN/LEFT/RIGHT drive the analog stick axes, not d-pad buttons.
+          // N64 games read movement from axes[0]/axes[1]; the d-pad is rarely used.
+          const N64_AXIS = { 4: [1, -1], 5: [1, 1], 6: [0, -1], 7: [0, 1] }; // retroId → [axisIdx, sign]
+          const ax = N64_AXIS[data.id];
+          if (ax) {
+            setVirtualAxis(remoteId + 1, ax[0], data.pressed ? ax[1] : 0);
+          } else {
+            setVirtualButton(remoteId + 1, RETRO_TO_PAD[data.id], data.pressed);
+          }
         }
+      } else if (data.type === 'axis' && state.n64Running) {
+        setVirtualAxis(remoteId + 1, data.index, data.value);
       }
     });
     conn.on('close', function() {

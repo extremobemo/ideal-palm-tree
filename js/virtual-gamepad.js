@@ -42,6 +42,13 @@ export function setVirtualButton(padIndex, buttonIndex, pressed) {
   _virtualPads[padIndex].timestamp = performance.now();
 }
 
+export function setVirtualAxis(padIndex, axisIndex, value) {
+  while (_virtualPads.length <= padIndex) _virtualPads.push(null);
+  if (!_virtualPads[padIndex]) _virtualPads[padIndex] = makeVirtualPad(padIndex);
+  _virtualPads[padIndex].axes[axisIndex] = value;
+  _virtualPads[padIndex].timestamp = performance.now();
+}
+
 // Install the patch once at module load time.
 // Real gamepads are returned as-is; virtual pads fill any empty slots after them.
 if (navigator.getGamepads) {
