@@ -1,12 +1,5 @@
-# Build outputs
-game*.js
-game*.wasm
-game*.data
-core_*.js
-core_*.wasm
-n64wasm.js
-n64wasm.wasm
-assets.zip
+# Cores — cloned at build time by build.sh (not needed for deployment)
+
 
 # Emscripten generated
 *.mem
