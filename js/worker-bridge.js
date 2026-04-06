@@ -6,9 +6,6 @@ import { state, shareCanvas, shareCtx } from './state.js';
 import { startAudio, receiveAudio } from './audio.js';
 import { setStatus } from './utils.js';
 
-// File extensions that require a PS1 BIOS before loading
-export const PS1_EXTS = new Set(['bin', 'cue', 'chd', 'img']);
-
 // BIOS/save state — kept module-local, sent to worker on spawn
 let _ps1BiosName  = null;
 let _ps1BiosBytes = null;
@@ -18,6 +15,14 @@ export function setBiosFile(name, bytes) {
   _ps1BiosName  = name;
   _ps1BiosBytes = bytes;
   ps1BiosLoaded = true;
+}
+
+let _saturnBiosBytes = null;
+export let saturnBiosLoaded = false;
+
+export function setSaturnBiosFile(bytes) {
+  _saturnBiosBytes = bytes;
+  saturnBiosLoaded = true;
 }
 
 
@@ -125,7 +130,7 @@ export function spawnCoreWorker(bundle, file, ext) {
   setStatus('Loading core...');
   const reader = new FileReader();
   reader.onload = function(ev) {
-    state.coreWorker = new Worker('core_worker.js');
+    state.coreWorker = new Worker('core_worker.js?v=' + Date.now());
     state.coreWorker.onmessage = onWorkerMessage;
     state.coreWorker.onerror = function(e) {
       setStatus('Worker error: ' + (e.message || e));
@@ -136,10 +141,15 @@ export function spawnCoreWorker(bundle, file, ext) {
       bundle:   bundle,
       romName:  file.name,
       romBytes: ev.target.result,  // transferred (zero-copy)
+      version:  Date.now(),
     };
-    if (PS1_EXTS.has(ext) && _ps1BiosBytes) {
+    if (bundle === 'core_ps1.js' && _ps1BiosBytes) {
       msg.biosName  = _ps1BiosName;
       msg.biosBytes = _ps1BiosBytes.buffer.slice(0);  // copy — keep original
+    }
+    if (bundle === 'core_saturn.js' && _saturnBiosBytes) {
+      msg.biosBytes   = _saturnBiosBytes.buffer.slice(0);
+      msg.biosType    = 'saturn';
     }
 
     state.coreWorker.postMessage(msg, [msg.romBytes]);

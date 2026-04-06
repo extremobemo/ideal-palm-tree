@@ -182,7 +182,48 @@ em++ -O2 -std=c++17 \
   -s ENVIRONMENT=worker \
   -o core_gba.js
 
-# ── 12. Download N64Wasm prebuilt files ───────────────────────────────────────
+# ── 12. Build Yabause core (Sega Saturn) ─────────────────────────────────────
+YABAUSE_A=cores/yabause/yabause_libretro.a
+if [ ! -f "$SCRIPT_DIR/$YABAUSE_A" ]; then
+    mkdir -p cores
+    [ ! -d "$SCRIPT_DIR/cores/yabause" ] && \
+        git clone --depth 1 "https://github.com/libretro/yabause" "$SCRIPT_DIR/cores/yabause"
+    # Remove x86-only flag that Emscripten/clang doesn't support
+    sed -i 's/-mfpmath=sse//g' "$SCRIPT_DIR/cores/yabause/yabause/src/libretro/Makefile"
+    cd "$SCRIPT_DIR/cores/yabause/yabause/src/libretro"
+    # HAVE_THREADS=0: use thr-dummy.c instead of thr-rthreads.c (avoids missing slock/sthread symbols)
+    emmake make platform=emscripten HAVE_THREADS=0 CC=emcc CXX=em++ AR=emar RANLIB=emranlib
+    for f in "yabause_libretro_emscripten.bc" "yabause_libretro_emscripten.a" \
+             "yabause_libretro.bc" "yabause_libretro.a"; do
+        [ -f "$f" ] && { cp "$f" "$SCRIPT_DIR/$YABAUSE_A"; break; }
+    done
+    cd "$SCRIPT_DIR"
+    [ ! -f "$SCRIPT_DIR/$YABAUSE_A" ] && { echo "yabause_libretro.a build failed"; exit 1; }
+    # Remove thr-rthreads.c.o: emar rcs appends into existing archives so the old
+    # rthreads object may linger; strip it to avoid missing-symbol link errors.
+    emar d "$SCRIPT_DIR/$YABAUSE_A" thr-rthreads.c.o 2>/dev/null || true
+    echo "yabause_libretro.a: built"
+else
+    echo "yabause_libretro.a: cached"
+fi
+
+# ── 13. Link Saturn core bundle (Web Worker) ─────────────────────────────────
+# INITIAL_MEMORY=256 MB: Saturn has dual SH-2 CPUs + VDP1/VDP2 graphics chips
+echo "Linking core_saturn.js..."
+em++ -O2 -std=c++17 \
+  -I include \
+  -I "$LIBRETRO_COMMON/include" \
+  core.cpp \
+  "$COMMON_A" \
+  "$YABAUSE_A" \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
+  -s EXPORTED_FUNCTIONS="$CORE_EXPORTS" \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s INITIAL_MEMORY=268435456 \
+  -s ENVIRONMENT=worker \
+  -o core_saturn.js
+
+# ── 14. Download N64Wasm prebuilt files ───────────────────────────────────────
 if [ ! -f n64wasm.js ]; then
   echo "Downloading N64Wasm prebuilt..."
   curl -Lo n64wasm.js \

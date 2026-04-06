@@ -39,8 +39,7 @@ self.onmessage = function(e) {
 };
 
 function loadCore(msg) {
-  // Emscripten sets Module on the global (self) when the script runs
-  self.importScripts(msg.bundle);
+  self.importScripts(msg.bundle + '?v=' + msg.version);
 
   function check() {
     if (self.Module && self.Module.calledRun) {
@@ -54,9 +53,16 @@ function loadCore(msg) {
 }
 
 function onReady(msg) {
-  // Write filesystem files before calling start_game
-  if (msg.biosBytes && msg.biosName) {
-    try { coreM.FS.mkdir('/system'); } catch(e) {}
+  // Write filesystem files before calling start_game.
+  // retro_init() is now called inside start_game() (not in main()), so BIOS files
+  // written here are available when the core initialises.
+  try { coreM.FS.mkdir('/system'); } catch(e) {}
+  if (msg.biosType === 'saturn') {
+    var satBios = new Uint8Array(msg.biosBytes);
+    coreM.FS.writeFile('/system/saturn_bios.bin', satBios);
+    coreM.FS.writeFile('/system/sega_101.bin',    satBios);
+    coreM.FS.writeFile('/system/mpr-17933.bin',   satBios);
+  } else if (msg.biosBytes && msg.biosName) {
     coreM.FS.writeFile('/system/' + msg.biosName, new Uint8Array(msg.biosBytes));
   }
   if (msg.saveBytes) {

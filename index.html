@@ -144,6 +144,13 @@
     color: #fff; font: bold 18px sans-serif;
   }
 
+  /* ── Disc system picker ── */
+  #disc-prompt {
+    position: fixed; inset: 0; z-index: 700;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(6,6,8,0.93);
+  }
+
   /* ── Join prompt ── */
   #join-prompt {
     position: fixed; inset: 0; z-index: 700;
@@ -215,6 +222,17 @@
   <div id="preview-nameplate" class="hidden"></div>
 </div>
 
+<!-- ── Disc system picker (PS1 vs Saturn) ── -->
+<div id="disc-prompt" class="hidden">
+  <div id="join-prompt-inner">
+    <p>Select system</p>
+    <div style="display:flex;gap:10px">
+      <button id="disc-pick-ps1">PS1</button>
+      <button id="disc-pick-saturn">Saturn</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Guest: enter host peer ID ── -->
 <div id="join-prompt" class="hidden">
   <div id="join-prompt-inner">
@@ -279,6 +297,14 @@
       <label class="core-note" style="cursor:pointer" title="Click to upload BIOS">
         <span id="core-note-ps1" style="text-decoration:underline dotted"></span>
         <input type="file" id="bios-input" accept=".bin" hidden>
+      </label>
+    </div>
+    <div class="core-row">
+      <span id="core-icon-saturn" class="core-icon">⏳</span>
+      <span class="core-label">Sega Saturn</span>
+      <label class="core-note" style="cursor:pointer" title="Click to upload BIOS">
+        <span id="core-note-saturn" style="text-decoration:underline dotted"></span>
+        <input type="file" id="saturn-bios-input" accept=".bin" hidden>
       </label>
     </div>
     <div class="core-row">

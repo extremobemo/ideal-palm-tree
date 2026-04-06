@@ -99,9 +99,9 @@ bool retro_environment(unsigned cmd, void* data) {
         case RETRO_ENVIRONMENT_GET_CAN_DUPE:
             *(bool*)data=true; return true;
         case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
-            *(const char**)data="/system/"; return true;
+            *(const char**)data="/system"; return true;
         case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
-            *(const char**)data="/saves/"; return true;
+            *(const char**)data="/saves"; return true;
         case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
             ((retro_log_callback*)data)->log=retro_log_cb; return true;
         default: return false;
@@ -117,6 +117,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_button(int id, int pressed) {
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {
+    // retro_init is called here (not in main) so that BIOS/system files written
+    // by core_worker.js onReady are already in the FS before the core initialises.
+    retro_init();
     FILE* f=fopen(path,"rb");
     if (!f) { printf("Cannot open %s\n",path); return; }
     fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
@@ -179,8 +182,7 @@ int main() {
     retro_set_audio_sample_batch(retro_audio_sample_batch);
     retro_set_input_poll       (retro_input_poll);
     retro_set_input_state      (retro_input_state);
-    retro_init();
-    // Keep runtime alive so JS can call step_frame(), start_game(), etc. via ccall
+    // retro_init is deferred to start_game() so BIOS files can be written first
     emscripten_exit_with_live_runtime();
     return 0;
 }

@@ -3,7 +3,7 @@
 
 import { state } from './state.js';
 import { setStatus } from './utils.js';
-import { spawnCoreWorker, setBiosFile, ps1BiosLoaded, PS1_EXTS } from './worker-bridge.js';
+import { spawnCoreWorker, setBiosFile, ps1BiosLoaded, setSaturnBiosFile, saturnBiosLoaded } from './worker-bridge.js';
 import { loadN64 } from './n64.js';
 import { mpHost, mpJoin, broadcastScene } from './multiplayer.js';
 import { initInput } from './input.js';
@@ -41,11 +41,11 @@ const CORE_MAP = {
   'fig': 'core_snes.js',
   'swc': 'core_snes.js',
   'bs':  'core_snes.js',
-  'bin': 'core_ps1.js',
-  'cue': 'core_ps1.js',
-  'chd': 'core_ps1.js',
-  'img': 'core_ps1.js',
+  'iso': 'core_saturn.js',
+  'ccd': 'core_saturn.js',
 };
+// Extensions shared between PS1 and Saturn — trigger a system picker
+const DISC_EXTS = new Set(['bin', 'cue', 'chd', 'img']);
 const N64_EXTS = new Set(['z64', 'n64', 'v64']);
 
 // ── Renderer loader ───────────────────────────────────────────
@@ -164,29 +164,30 @@ function setCoreIcon(id, ok, note) {
 }
 
 function checkCores() {
-  const coreFiles = { gbc: 'core_gbc.js', gba: 'core_gba.js', snes: 'core_snes.js' };
-  Object.entries(coreFiles).forEach(function([id, file]) {
-    fetch(file, { method: 'HEAD' })
+  // Simple cores — just check file presence
+  ['gbc', 'gba', 'snes'].forEach(function(id) {
+    fetch('core_' + id + '.js', { method: 'HEAD' })
       .then(function(r) { setCoreIcon(id, r.ok); })
       .catch(function()  { setCoreIcon(id, false); });
   });
 
-  // PS1 also requires a BIOS file from the user
+  // PS1 — requires BIOS; track availability for the BIOS upload handler
   fetch('core_ps1.js', { method: 'HEAD' })
     .then(function(r) {
       _ps1CoreAvailable = r.ok;
-      if (!r.ok) { setCoreIcon('ps1', false, '(file missing)'); return; }
-      setCoreIcon('ps1', false, '(needs BIOS)');
+      setCoreIcon('ps1', false, r.ok ? '(needs BIOS)' : '(file missing)');
     })
-    .catch(function() {
-      _ps1CoreAvailable = false;
-      setCoreIcon('ps1', false, '(file missing)');
-    });
+    .catch(function() { _ps1CoreAvailable = false; setCoreIcon('ps1', false, '(file missing)'); });
+
+  // Saturn — requires BIOS
+  fetch('core_saturn.js', { method: 'HEAD' })
+    .then(function(r) { setCoreIcon('saturn', false, r.ok ? '(needs BIOS)' : '(file missing)'); })
+    .catch(function() { setCoreIcon('saturn', false, '(file missing)'); });
 
   // N64 needs both the JS bundle and assets.zip
   Promise.all([
-    fetch('n64wasm.js',  { method: 'HEAD' }).then(r => r.ok).catch(() => false),
-    fetch('assets.zip',  { method: 'HEAD' }).then(r => r.ok).catch(() => false),
+    fetch('n64wasm.js', { method: 'HEAD' }).then(r => r.ok).catch(() => false),
+    fetch('assets.zip', { method: 'HEAD' }).then(r => r.ok).catch(() => false),
   ]).then(function([wasm, assets]) {
     if (wasm && assets) { setCoreIcon('n64', true); }
     else { setCoreIcon('n64', false, wasm ? '(missing assets.zip)' : '(file missing)'); }
@@ -208,6 +209,18 @@ document.getElementById('bios-input').addEventListener('change', function(e) {
   reader.readAsArrayBuffer(file);
 });
 
+document.getElementById('saturn-bios-input').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    setSaturnBiosFile(new Uint8Array(ev.target.result));
+    setCoreIcon('saturn', true, '');
+    setStatus('Saturn BIOS ready: ' + file.name + ' — now load a Saturn disc');
+  };
+  reader.readAsArrayBuffer(file);
+});
+
 
 document.getElementById('rom-input').addEventListener('change', function(e) {
   const file = e.target.files[0];
@@ -219,18 +232,53 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
     return;
   }
 
+  if (DISC_EXTS.has(ext)) {
+    _discPickerFile = file;
+    _discPickerExt  = ext;
+    document.getElementById('disc-prompt').classList.remove('hidden');
+    return;
+  }
+
   const bundle = CORE_MAP[ext];
   if (!bundle) {
     setStatus('Unsupported format: .' + ext);
     return;
   }
 
-  if (PS1_EXTS.has(ext) && !ps1BiosLoaded) {
-    setStatus('Load a PS1 BIOS (.bin) first, then reload your disc');
+  if (bundle === 'core_saturn.js' && !saturnBiosLoaded) {
+    setStatus('Load a Saturn BIOS (.bin) first via Settings, then reload your disc');
     return;
   }
 
   spawnCoreWorker(bundle, file, ext);
+});
+
+// ── Disc system picker ────────────────────────────────────────
+let _discPickerFile = null;
+let _discPickerExt  = null;
+
+function _launchDisc(bundle) {
+  document.getElementById('disc-prompt').classList.add('hidden');
+  const file = _discPickerFile;
+  const ext  = _discPickerExt;
+  _discPickerFile = null;
+  _discPickerExt  = null;
+  spawnCoreWorker(bundle, file, ext);
+}
+
+const _discSystems = [
+  { id: 'disc-pick-ps1',    bundle: 'core_ps1.js',    biosCheck: () => ps1BiosLoaded,    biosMsg: 'Load a PS1 BIOS (.bin) first, then reload your disc' },
+  { id: 'disc-pick-saturn', bundle: 'core_saturn.js', biosCheck: () => saturnBiosLoaded, biosMsg: 'Load a Saturn BIOS (.bin) first via Settings, then reload your disc' },
+];
+_discSystems.forEach(function({ id, bundle, biosCheck, biosMsg }) {
+  document.getElementById(id).addEventListener('click', function() {
+    if (!biosCheck()) {
+      document.getElementById('disc-prompt').classList.add('hidden');
+      setStatus(biosMsg);
+      return;
+    }
+    _launchDisc(bundle);
+  });
 });
 
 // ── Screen state machine ──────────────────────────────────────
