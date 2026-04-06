@@ -30,7 +30,7 @@ static unsigned g_frame_w  = 160, g_frame_h = 144; // updated by retro_video_ref
 
 static retro_pixel_format g_pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
 static bool     g_running  = false;
-static bool     g_buttons[16] = {};
+static bool     g_buttons[4][16] = {};  // [port][button], up to 4 simultaneous players
 
 // ============================================================
 //  Libretro callbacks
@@ -89,8 +89,8 @@ size_t retro_audio_sample_batch(const int16_t* data, size_t frames) {
 }
 void   retro_input_poll() {}
 int16_t retro_input_state(unsigned port,unsigned device,unsigned,unsigned id) {
-    if (port||device!=RETRO_DEVICE_JOYPAD||id>=16) return 0;
-    return g_buttons[id]?1:0;
+    if (port>=4||device!=RETRO_DEVICE_JOYPAD||id>=16) return 0;
+    return g_buttons[port][id]?1:0;
 }
 bool retro_environment(unsigned cmd, void* data) {
     switch(cmd) {
@@ -112,8 +112,8 @@ bool retro_environment(unsigned cmd, void* data) {
 //  Exported functions (called by core_worker.js via ccall)
 // ============================================================
 
-extern "C" EMSCRIPTEN_KEEPALIVE void set_button(int id, int pressed) {
-    if (id>=0&&id<16) g_buttons[id]=pressed;
+extern "C" EMSCRIPTEN_KEEPALIVE void set_button(int port, int id, int pressed) {
+    if (port>=0&&port<4&&id>=0&&id<16) g_buttons[port][id]=pressed;
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {

@@ -6,11 +6,17 @@ import { state, shareCanvas, shareCtx } from './state.js';
 import { jsUpdateQuadColors } from './worker-bridge.js';
 import { setStatus } from './utils.js';
 import { getGameAudioTrack, startViewerAudio, setAudioSourcePos, setAudioPannerSettings } from './audio.js';
+import { setVirtualButton } from './virtual-gamepad.js';
 
-let peerInst  = null;
-let mpConns   = [];
-let gameStream = null;
-let hostConn  = null;   // guest-side: connection back to the host
+// Reverse of PAD_BUTTON_MAP in input.js: libretro button ID → standard gamepad button index
+const RETRO_TO_PAD = {};
+[[0,8],[1,0],[2,9],[3,1],[4,10],[5,11],[6,12],[7,13],[8,2],[9,3],[10,14],[11,15],[12,4],[13,5],[14,6],[15,7]]
+  .forEach(([gpIdx, retroId]) => { RETRO_TO_PAD[retroId] = gpIdx; });
+
+let peerInst    = null;
+let mpConns     = [];
+let gameStream  = null;
+let hostConn    = null;   // guest-side: connection back to the host
 let remoteNames = new Array(8).fill('');  // last-seen name per remote slot
 
 // Generate a nameplate RGBA texture and upload it to C++ for the given remote slot
@@ -123,28 +129,6 @@ function mpSetStatus(msg) {
   document.getElementById('mp-status').textContent = msg;
 }
 
-function ctrlSend(connIdx, isController) {
-  const c = mpConns[connIdx];
-  if (c && c.open) c.send({ type: 'ctrl', isController });
-}
-
-function ctrlSetHost() {
-  if (state.controller !== 'host') {
-    ctrlSend(state.controller, false);
-  }
-  state.controller = 'host';
-  const sel = document.getElementById('controller-select');
-  if (sel) sel.value = 'host';
-}
-
-document.getElementById('controller-select').addEventListener('change', function() {
-  const prev = state.controller;
-  const next = this.value === 'host' ? 'host' : parseInt(this.value);
-  if (prev !== 'host') ctrlSend(prev, false);
-  state.controller = next;
-  if (next !== 'host') ctrlSend(next, true);
-});
-
 // Broadcast local player position + model to all connected peers at 60 Hz
 function startPositionSync(conn) {
   setInterval(function() {
@@ -251,9 +235,7 @@ function setupVideoReceive(stream) {
 
 export function mpHost() {
   state.mpIsHost = true;
-  state.controller = 'host';
   startFrameCapture();
-  document.getElementById('controller-wrap').style.display = '';
   peerInst = new window.Peer();
   peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
   peerInst.on('open', function(id) {
@@ -268,14 +250,6 @@ export function mpHost() {
       conn.send(getSceneState());
       mpSetStatus('Guest connected');
       startPositionSync(conn);
-      // Add this guest to the controller select
-      const sel = document.getElementById('controller-select');
-      if (sel) {
-        const opt = document.createElement('option');
-        opt.value = remoteId;
-        opt.textContent = 'Guest ' + (remoteId + 1);
-        sel.appendChild(opt);
-      }
     });
     conn.on('data', function(data) {
       if (data.type === 'pos' && state.rendererModule) {
@@ -298,8 +272,13 @@ export function mpHost() {
         });
       } else if (data.type === 'scene') {
         applySceneState(data);
-      } else if (data.type === 'btn' && state.controller === remoteId && state.coreWorker) {
-        state.coreWorker.postMessage({ type: 'button', id: data.id, pressed: data.pressed });
+      } else if (data.type === 'btn') {
+        // Each guest owns their own controller port (remoteId 0 → port 1, etc.)
+        if (state.coreWorker) {
+          state.coreWorker.postMessage({ type: 'button', port: remoteId + 1, id: data.id, pressed: data.pressed });
+        } else if (state.n64Running) {
+          setVirtualButton(remoteId + 1, RETRO_TO_PAD[data.id], data.pressed);
+        }
       }
     });
     conn.on('close', function() {
@@ -309,16 +288,9 @@ export function mpHost() {
           otherConn.send({ type: 'remove_player', slot: remoteId + 1 });
       });
       // If this guest had control, reset to host
-      if (state.controller === remoteId) ctrlSetHost();
       remoteNames[remoteId] = '';
       if (state.rendererModule)
         state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [remoteId]);
-      // Remove their option from the controller select
-      const sel = document.getElementById('controller-select');
-      if (sel) {
-        const opt = sel.querySelector('option[value="' + remoteId + '"]');
-        if (opt) opt.remove();
-      }
       mpConns.splice(mpConns.indexOf(conn), 1);
       mpSetStatus('Guest disconnected');
     });
@@ -376,13 +348,10 @@ export function mpJoin(hostId) {
           state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [data.slot]);
       } else if (data.type === 'scene') {
         applySceneState(data);
-      } else if (data.type === 'ctrl') {
-        state.isController = !!data.isController;
       }
     });
     hostConn.on('close', function() {
       state.mpConnected = false;
-      state.isController = false;
       remoteNames[0] = '';
       document.querySelector('.scene-section').style.display = '';
       if (state.rendererModule)

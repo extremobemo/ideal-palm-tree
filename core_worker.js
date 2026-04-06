@@ -32,7 +32,7 @@ self.onmessage = function(e) {
   if (msg.type === 'load') {
     loadCore(msg);
   } else if (msg.type === 'button') {
-    if (coreM) coreM._set_button(msg.id, msg.pressed ? 1 : 0);
+    if (coreM) coreM._set_button(msg.port || 0, msg.id, msg.pressed ? 1 : 0);
   } else if (msg.type === 'terminate') {
     if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
   }
