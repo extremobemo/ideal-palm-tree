@@ -41,7 +41,11 @@ self.onmessage = function(e) {
 };
 
 function loadCore(msg) {
-  self.importScripts(msg.bundle + '?v=' + msg.version);
+  // Tell Emscripten to resolve .wasm relative to the bundle path, not the worker location.
+  var bundleDir = msg.bundle.substring(0, msg.bundle.lastIndexOf('/') + 1);
+  self.Module = { locateFile: function(path) { return '/' + bundleDir + path; } };
+
+  self.importScripts('/' + msg.bundle + '?v=' + msg.version);
 
   function check() {
     if (self.Module && self.Module.calledRun) {
