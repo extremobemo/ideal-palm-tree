@@ -184,3 +184,10 @@ export function getGLTextures() {
 export function getGLContext() {
   return state.frontendCtx;
 }
+
+// ── Canvas resize (fullscreen) ──────────────────────────────
+
+export function resizeCanvas() {
+  if (_hasExport('resize_canvas'))
+    _ccall('resize_canvas', null, [], []);
+}

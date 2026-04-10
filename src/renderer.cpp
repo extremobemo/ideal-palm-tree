@@ -303,6 +303,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_preview_mode(int model_idx) {
     g_preview_active=true;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void exit_preview_mode() { g_preview_active=false; }
+extern "C" EMSCRIPTEN_KEEPALIVE void resize_canvas() {
+    emscripten_get_canvas_element_size("#canvas", &g_scene.canvas_w, &g_scene.canvas_h);
+}
 
 // ============================================================
 //  Main loop

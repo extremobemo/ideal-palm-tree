@@ -18,6 +18,31 @@ import { CANVAS_ASPECT, CANVAS_MAX_WIDTH_RATIO, CANVAS_PADDING, BUILD_DIR } from
 // ── Canvas sizing ────────────────────────────────────────────
 const canvas = document.getElementById('canvas');
 
+const _nativeWidthDesc  = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'width');
+const _nativeHeightDesc = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'height');
+
+function _lockCanvas() {
+  Object.defineProperty(canvas, 'width', {
+    get()  { return _nativeWidthDesc.get.call(this); },
+    set()  {},
+    configurable: true
+  });
+  Object.defineProperty(canvas, 'height', {
+    get()  { return _nativeHeightDesc.get.call(this); },
+    set()  {},
+    configurable: true
+  });
+}
+
+function _setCanvasSize(w, h) {
+  // Remove own property overrides so the native prototype setter is reachable
+  delete canvas.width;
+  delete canvas.height;
+  canvas.width  = w;
+  canvas.height = h;
+  _lockCanvas();
+}
+
 (function sizeCanvas() {
   const maxW = Math.round(window.innerWidth * CANVAS_MAX_WIDTH_RATIO);
   const maxH = window.innerHeight - CANVAS_PADDING;
@@ -27,9 +52,32 @@ const canvas = document.getElementById('canvas');
   canvas.height = h;
   // Lock dimensions — n64wasm's SDL fires resize events that would otherwise
   // shrink this canvas to N64 native resolution.
-  Object.defineProperty(canvas, 'width',  { get: () => w, set: () => {} });
-  Object.defineProperty(canvas, 'height', { get: () => h, set: () => {} });
+  _lockCanvas();
 })();
+
+// ── Fullscreen ───────────────────────────────────────────────
+let _windowedW, _windowedH;
+
+document.getElementById('fullscreen-btn').addEventListener('click', function() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    canvas.requestFullscreen().catch(function(err) {
+      console.error('Fullscreen request failed:', err);
+    });
+  }
+});
+
+document.addEventListener('fullscreenchange', function() {
+  if (document.fullscreenElement === canvas) {
+    _windowedW = canvas.width;
+    _windowedH = canvas.height;
+    _setCanvasSize(screen.width * devicePixelRatio, screen.height * devicePixelRatio);
+  } else {
+    _setCanvasSize(_windowedW, _windowedH);
+  }
+  renderer.resizeCanvas();
+});
 
 // ── Global error display ─────────────────────────────────────
 window.onerror = function(msg, src, line) {

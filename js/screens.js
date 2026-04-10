@@ -15,7 +15,7 @@ let _pendingHostId = null;
 
 export function showScreen(name) {
   ['landing-screen', 'carousel-screen', 'carousel-controls', 'join-prompt',
-   'ui', 'mp-bar', 'settings-btn', 'controls-btn'].forEach(function(id) {
+   'ui', 'mp-bar', 'settings-btn', 'controls-btn', 'fullscreen-btn'].forEach(function(id) {
     const el = document.getElementById(id);
     if (el) el.classList.add('hidden');
   });
@@ -25,7 +25,7 @@ export function showScreen(name) {
     document.getElementById('carousel-screen').classList.remove('hidden');
     document.getElementById('carousel-controls').classList.remove('hidden');
   } else if (name === 'room') {
-    ['ui', 'mp-bar', 'settings-btn', 'controls-btn', 'overlay'].forEach(function(id) {
+    ['ui', 'mp-bar', 'settings-btn', 'controls-btn', 'fullscreen-btn', 'overlay'].forEach(function(id) {
       document.getElementById(id).classList.remove('hidden');
     });
   }
